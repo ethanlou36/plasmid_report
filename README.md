@@ -78,8 +78,8 @@ Each barcode must have:
 - `barcodeXX.annotations.gbk`
 - `barcodeXX.final.fastq`
 - one raw reads FASTQ/FASTQ.GZ file whose filename contains the barcode, such
-  as `barcode01.fastq.gz`. The raw FASTQ must be at least 100 KB and contain at
-  least 100 reads. Use `--use-bam` only when you intentionally want to run from
+  as `barcode01.fastq.gz`. The raw FASTQ must contain at least 100 reads and
+  100,000 read bases. Use `--use-bam` only when you intentionally want to run from
   a raw/unmapped `.bam` file instead.
 
 Optional files:

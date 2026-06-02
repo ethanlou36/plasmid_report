@@ -109,8 +109,8 @@ DEFAULT_LOGO_PATH = Path(__file__).resolve().with_name("Alta Biotech Logo.jpg")
 DEFAULT_ECOLI_REFERENCE_FASTA = Path(__file__).resolve().with_name("E. Coli Genome.fna")
 HOST_DNA_MIN_ALIGNED_BP = 1300
 HOST_DNA_MIN_ALIGNED_PCT = 91.0
-RAW_FASTQ_MIN_BYTES = 100_000
 RAW_FASTQ_MIN_RECORDS = 100
+RAW_FASTQ_MIN_BASES = 100_000
 
 
 def slugify(value: str) -> str:
@@ -571,10 +571,11 @@ def infer_fastq_barcode(path: Path) -> str | None:
     return None
 
 
-def count_fastq_records_up_to(path: Path, limit: int) -> int:
+def scan_fastq_until(path: Path, min_records: int, min_bases: int) -> tuple[int, int]:
     count = 0
+    bases = 0
     with open_fastq_text(path) as handle:
-        while count < limit:
+        while count < min_records or bases < min_bases:
             header = handle.readline().rstrip("\n\r")
             if not header:
                 break
@@ -584,19 +585,19 @@ def count_fastq_records_up_to(path: Path, limit: int) -> int:
             if not header.startswith("@") or not plus.startswith("+") or len(seq) != len(qual):
                 raise ValueError(f"Malformed FASTQ record in {path}")
             count += 1
-    return count
+            bases += len(seq)
+    return count, bases
 
 
 def raw_fastq_rejection_reason(path: Path) -> str | None:
-    size = path.stat().st_size
-    if size < RAW_FASTQ_MIN_BYTES:
-        return f"{path} is only {size:,} bytes; expected at least {RAW_FASTQ_MIN_BYTES:,} bytes"
     try:
-        record_count = count_fastq_records_up_to(path, RAW_FASTQ_MIN_RECORDS)
+        record_count, base_count = scan_fastq_until(path, RAW_FASTQ_MIN_RECORDS, RAW_FASTQ_MIN_BASES)
     except ValueError as exc:
         return str(exc)
     if record_count < RAW_FASTQ_MIN_RECORDS:
         return f"{path} has only {record_count} FASTQ records; expected at least {RAW_FASTQ_MIN_RECORDS}"
+    if base_count < RAW_FASTQ_MIN_BASES:
+        return f"{path} has only {base_count:,} read bases; expected at least {RAW_FASTQ_MIN_BASES:,}"
     return None
 
 
