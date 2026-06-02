@@ -111,6 +111,7 @@ HOST_DNA_MIN_ALIGNED_BP = 1300
 HOST_DNA_MIN_ALIGNED_PCT = 91.0
 RAW_FASTQ_MIN_RECORDS = 100
 RAW_FASTQ_MIN_BASES = 100_000
+RAW_FASTQ_SCAN_RECORD_LIMIT = 100_000
 
 
 def slugify(value: str) -> str:
@@ -575,7 +576,7 @@ def scan_fastq_until(path: Path, min_records: int, min_bases: int) -> tuple[int,
     count = 0
     bases = 0
     with open_fastq_text(path) as handle:
-        while count < min_records or bases < min_bases:
+        while count < RAW_FASTQ_SCAN_RECORD_LIMIT and (count < min_records or bases < min_bases):
             header = handle.readline().rstrip("\n\r")
             if not header:
                 break
@@ -696,11 +697,23 @@ def discover_raw_fastq_files(
         grouped[barcode].append(path)
 
     for barcode, paths in sorted(grouped.items()):
-        rejected = {
-            path: reason
-            for path in sorted(paths)
-            if (reason := raw_fastq_rejection_reason(path)) is not None
-        }
+        scanned = {}
+        rejected = {}
+        for path in sorted(paths):
+            try:
+                record_count, base_count = scan_fastq_until(path, RAW_FASTQ_MIN_RECORDS, RAW_FASTQ_MIN_BASES)
+            except ValueError as exc:
+                rejected[path] = str(exc)
+                continue
+            scanned[path] = (record_count, base_count)
+            if record_count < RAW_FASTQ_MIN_RECORDS:
+                rejected[path] = (
+                    f"{path} has only {record_count} FASTQ records; expected at least {RAW_FASTQ_MIN_RECORDS}"
+                )
+            elif base_count < RAW_FASTQ_MIN_BASES:
+                rejected[path] = (
+                    f"{path} has only {base_count:,} read bases; expected at least {RAW_FASTQ_MIN_BASES:,}"
+                )
         eligible_paths = [path for path in sorted(paths) if path not in rejected]
         if not eligible_paths:
             record = records[barcode]
@@ -715,7 +728,12 @@ def discover_raw_fastq_files(
 
         selected = max(
             eligible_paths,
-            key=lambda path: (path.stat().st_size, "final" not in normalize_header(path.stem)),
+            key=lambda path: (
+                scanned[path][1],
+                scanned[path][0],
+                "final" not in normalize_header(path.stem),
+                path.stat().st_size,
+            ),
         )
         record = records[barcode]
         record["barcode"] = barcode
@@ -800,6 +818,13 @@ def collapse_mixed_contigs_to_primary(records: dict[str, dict[str, object]]) -> 
 
         primary_record_id = primary_record_id_for_mixed_contigs(records, contig_record_ids)
         primary = dict(records[primary_record_id])
+        shared_record = records.get(barcode, {})
+        for key in ("bam", "fastq", "raw_fastq", "maf", "raw_fastq_error"):
+            if key in shared_record:
+                primary.setdefault(key, shared_record[key])
+        shared_warnings = shared_record.get("input_warnings")
+        if isinstance(shared_warnings, list):
+            primary.setdefault("input_warnings", []).extend(shared_warnings)
         ignored_labels = [
             str(records[record_id].get("contig_label"))
             for record_id in sorted(contig_record_ids)
