@@ -67,23 +67,46 @@ def open_fastq_text(path):
     return path.open("r", encoding="ascii", errors="replace")
 
 
-def inspect_fastq_input(fastq_path):
+def normalize_fastq_paths(fastq_paths):
+    if isinstance(fastq_paths, (str, Path)):
+        paths = [Path(fastq_paths)]
+    else:
+        paths = [Path(path) for path in fastq_paths]
+    if not paths:
+        raise ValueError("At least one FASTQ path is required")
+    return paths
+
+
+def serialize_fastq_paths(fastq_paths):
+    paths = normalize_fastq_paths(fastq_paths)
+    if len(paths) == 1:
+        return str(paths[0])
+    return [str(path) for path in paths]
+
+
+def inspect_fastq_input(fastq_paths):
+    fastq_paths = normalize_fastq_paths(fastq_paths)
     records = 0
     bases = 0
-    with open_fastq_text(fastq_path) as handle:
-        while True:
-            header = handle.readline()
-            if not header:
-                break
-            seq = handle.readline().rstrip("\n\r")
-            plus = handle.readline()
-            qual = handle.readline().rstrip("\n\r")
-            if not plus or not header.startswith("@") or not plus.startswith("+") or len(seq) != len(qual):
-                raise ValueError(f"Malformed FASTQ record in {fastq_path}")
-            records += 1
-            bases += len(seq)
+    for fastq_path in fastq_paths:
+        file_records = 0
+        with open_fastq_text(fastq_path) as handle:
+            while True:
+                header = handle.readline()
+                if not header:
+                    break
+                seq = handle.readline().rstrip("\n\r")
+                plus = handle.readline()
+                qual = handle.readline().rstrip("\n\r")
+                if not plus or not header.startswith("@") or not plus.startswith("+") or len(seq) != len(qual):
+                    raise ValueError(f"Malformed FASTQ record in {fastq_path}")
+                records += 1
+                file_records += 1
+                bases += len(seq)
+        if file_records == 0:
+            raise ValueError(f"No FASTQ records found in {fastq_path}")
     if records == 0:
-        raise ValueError(f"No FASTQ records found in {fastq_path}")
+        raise ValueError(f"No FASTQ records found in {', '.join(str(path) for path in fastq_paths)}")
     return {
         "primary_reads": records,
         "total_bases": bases,
@@ -156,6 +179,7 @@ def align_fastq_to_reference(
 ):
     minimap2 = require_tool("minimap2")
     samtools = require_tool("samtools")
+    reads_fastq_paths = normalize_fastq_paths(reads_fastq)
 
     if threads < 1:
         raise ValueError("threads must be >= 1")
@@ -184,7 +208,7 @@ def align_fastq_to_reference(
                 "-ax",
                 minimap2_preset,
                 str(reference_path),
-                str(reads_fastq),
+                *[str(path) for path in reads_fastq_paths],
             ],
             stdout=sam_handle,
         )
@@ -223,7 +247,7 @@ def align_fastq_to_reference(
     removed_intermediates = [] if keep_intermediates else remove_intermediates(intermediates)
 
     return {
-        "reads_fastq": str(reads_fastq) if reads_fastq.exists() else None,
+        "reads_fastq": serialize_fastq_paths(reads_fastq_paths),
         "reference_fasta": str(reference_path),
         "reference_fai": str(reference_path) + ".fai",
         "sam": str(sam_path) if sam_path.exists() else None,
@@ -293,7 +317,7 @@ def run_fastq_pipeline(
 ):
     fastq_stats = inspect_fastq_input(fastq_path)
     result = align_fastq_to_reference(
-        Path(fastq_path),
+        normalize_fastq_paths(fastq_path),
         reference_path,
         out_dir,
         minimap2_preset=minimap2_preset,

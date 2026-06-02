@@ -77,10 +77,13 @@ Each barcode must have:
 - `barcodeXX.final.fasta`
 - `barcodeXX.annotations.gbk`
 - `barcodeXX.final.fastq`
-- one raw reads FASTQ/FASTQ.GZ file whose filename contains the barcode, such
-  as `barcode01.fastq.gz`. The raw FASTQ must contain at least 100 reads and
-  100,000 read bases. Use `--use-bam` only when you intentionally want to run from
-  a raw/unmapped `.bam` file instead.
+- one raw reads FASTQ/FASTQ.GZ input whose filename contains the barcode, such
+  as `barcode01.fastq.gz`. If the raw reads are split into numbered parts with
+  the same base name, such as `barcode01_0.fastq.gz`, `barcode01_1.fastq.gz`,
+  or `barcode01-1.fastq.gz`, `barcode01-2.fastq.gz`,
+  the script aggregates all parts as one raw input. The raw FASTQ input must
+  contain at least 100 reads and 100,000 read bases. Use `--use-bam` only when
+  you intentionally want to run from a raw/unmapped `.bam` file instead.
 
 Optional files:
 
@@ -91,7 +94,8 @@ FASTA with default quality scores, but the sample is reported with a warning.
 This `barcodeXX.final.fastq` file is the consensus FASTQ used for AB1 quality;
 it is not preferred as the raw read input for alignment metrics when a larger
 barcoded FASTQ is present. If multiple FASTQ files match a barcode, the script
-uses the largest file and reports a warning listing the ignored files.
+uses the largest eligible raw input set and reports a warning listing the ignored
+files. Numbered split files with the same base name are treated as one input set.
 If no matching FASTQ looks like a real raw-read file, the run stops rather than
 silently falling back to BAM.
 
@@ -201,7 +205,9 @@ classification rule. Base-weighted host percentages are also written to
 `report_summary.json` for review, but they are not used as the headline PDF
 value because a few very long host reads can otherwise dominate the number.
 By default, the raw reads come from the largest appropriately sized barcoded
-FASTQ/FASTQ.GZ. Pass `--use-bam` to force BAM input.
+FASTQ/FASTQ.GZ input set. Numbered split FASTQs with the same base name are
+aggregated before alignment and read-length metrics are calculated. Pass
+`--use-bam` to force BAM input.
 
 It is okay to reuse the same `--output-dir`. If the same barcode is run again,
 the script removes the previous files for that barcode and writes fresh ones.

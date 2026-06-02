@@ -112,6 +112,7 @@ HOST_DNA_MIN_ALIGNED_PCT = 91.0
 RAW_FASTQ_MIN_RECORDS = 100
 RAW_FASTQ_MIN_BASES = 100_000
 RAW_FASTQ_SCAN_RECORD_LIMIT = 100_000
+FASTQ_SUFFIXES = (".fastq.gz", ".fq.gz", ".fastq", ".fq")
 
 
 def slugify(value: str) -> str:
@@ -559,7 +560,57 @@ def match_barcode_file(path: Path, extensions: set[str], required_terms: set[str
 
 def is_fastq_path(path: Path) -> bool:
     name = path.name.lower()
-    return name.endswith((".fastq", ".fq", ".fastq.gz", ".fq.gz"))
+    return name.endswith(FASTQ_SUFFIXES)
+
+
+def fastq_stem_without_suffix(path: Path) -> str:
+    name = path.name
+    lower = name.lower()
+    for suffix in FASTQ_SUFFIXES:
+        if lower.endswith(suffix):
+            return name[: -len(suffix)]
+    return path.stem
+
+
+def fastq_split_group_name(path: Path) -> str:
+    return re.sub(r"[-_]\d+$", "", fastq_stem_without_suffix(path))
+
+
+def fastq_split_part_index(path: Path) -> int:
+    match = re.search(r"[-_](\d+)$", fastq_stem_without_suffix(path))
+    return int(match.group(1)) if match else 0
+
+
+def fastq_split_sort_key(path: Path) -> tuple[int, str]:
+    return fastq_split_part_index(path), path.name
+
+
+def normalize_path_list(value: object) -> list[Path]:
+    if value is None:
+        return []
+    if isinstance(value, Path):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        paths = []
+        for item in value:
+            if not isinstance(item, Path):
+                raise ValueError(f"invalid path list entry: {item!r}")
+            paths.append(item)
+        return paths
+    raise ValueError(f"invalid path value: {value!r}")
+
+
+def describe_path_list(paths: Iterable[Path]) -> str:
+    return ", ".join(str(path) for path in paths)
+
+
+def serialize_path_value(value: object) -> str | list[str] | None:
+    paths = normalize_path_list(value)
+    if not paths:
+        return None
+    if len(paths) == 1:
+        return str(paths[0])
+    return [str(path) for path in paths]
 
 
 def infer_fastq_barcode(path: Path) -> str | None:
@@ -587,6 +638,27 @@ def scan_fastq_until(path: Path, min_records: int, min_bases: int) -> tuple[int,
                 raise ValueError(f"Malformed FASTQ record in {path}")
             count += 1
             bases += len(seq)
+    return count, bases
+
+
+def scan_fastq_paths_until(paths: Iterable[Path], min_records: int, min_bases: int) -> tuple[int, int]:
+    count = 0
+    bases = 0
+    for path in paths:
+        with open_fastq_text(path) as handle:
+            while count < RAW_FASTQ_SCAN_RECORD_LIMIT and (count < min_records or bases < min_bases):
+                header = handle.readline().rstrip("\n\r")
+                if not header:
+                    break
+                seq = handle.readline().rstrip("\n\r")
+                plus = handle.readline().rstrip("\n\r")
+                qual = handle.readline().rstrip("\n\r")
+                if not header.startswith("@") or not plus.startswith("+") or len(seq) != len(qual):
+                    raise ValueError(f"Malformed FASTQ record in {path}")
+                count += 1
+                bases += len(seq)
+        if count >= RAW_FASTQ_SCAN_RECORD_LIMIT or (count >= min_records and bases >= min_bases):
+            break
     return count, bases
 
 
@@ -697,28 +769,43 @@ def discover_raw_fastq_files(
         grouped[barcode].append(path)
 
     for barcode, paths in sorted(grouped.items()):
+        candidate_groups: dict[tuple[Path, str], list[Path]] = defaultdict(list)
+        for path in sorted(paths):
+            candidate_groups[(path.parent.resolve(), fastq_split_group_name(path))].append(path)
+
         scanned = {}
         rejected = {}
-        for path in sorted(paths):
+        for group_key, group_paths in sorted(candidate_groups.items(), key=lambda item: (str(item[0][0]), item[0][1])):
+            group_paths = sorted(group_paths, key=fastq_split_sort_key)
             try:
-                record_count, base_count = scan_fastq_until(path, RAW_FASTQ_MIN_RECORDS, RAW_FASTQ_MIN_BASES)
+                record_count, base_count = scan_fastq_paths_until(
+                    group_paths,
+                    RAW_FASTQ_MIN_RECORDS,
+                    RAW_FASTQ_MIN_BASES,
+                )
             except ValueError as exc:
-                rejected[path] = str(exc)
+                rejected[group_key] = str(exc)
                 continue
-            scanned[path] = (record_count, base_count)
+            scanned[group_key] = (record_count, base_count)
             if record_count < RAW_FASTQ_MIN_RECORDS:
-                rejected[path] = (
-                    f"{path} has only {record_count} FASTQ records; expected at least {RAW_FASTQ_MIN_RECORDS}"
+                rejected[group_key] = (
+                    f"{describe_path_list(group_paths)} has only {record_count} FASTQ records; "
+                    f"expected at least {RAW_FASTQ_MIN_RECORDS}"
                 )
             elif base_count < RAW_FASTQ_MIN_BASES:
-                rejected[path] = (
-                    f"{path} has only {base_count:,} read bases; expected at least {RAW_FASTQ_MIN_BASES:,}"
+                rejected[group_key] = (
+                    f"{describe_path_list(group_paths)} has only {base_count:,} read bases; "
+                    f"expected at least {RAW_FASTQ_MIN_BASES:,}"
                 )
-        eligible_paths = [path for path in sorted(paths) if path not in rejected]
-        if not eligible_paths:
+        sorted_group_keys = sorted(candidate_groups, key=lambda key: (str(key[0]), key[1]))
+        eligible_group_keys = [group_key for group_key in sorted_group_keys if group_key not in rejected]
+        if not eligible_group_keys:
             record = records[barcode]
             record["barcode"] = barcode
-            details = "; ".join(rejected[path] for path in sorted(rejected))
+            details = "; ".join(
+                rejected[group_key]
+                for group_key in sorted(rejected, key=lambda key: (str(key[0]), key[1]))
+            )
             record["raw_fastq_error"] = (
                 f"no appropriately sized raw FASTQ found for {barcode}; {details}"
                 if details
@@ -726,23 +813,34 @@ def discover_raw_fastq_files(
             )
             continue
 
-        selected = max(
-            eligible_paths,
-            key=lambda path: (
-                scanned[path][1],
-                scanned[path][0],
-                "final" not in normalize_header(path.stem),
-                path.stat().st_size,
+        selected_key = max(
+            eligible_group_keys,
+            key=lambda group_key: (
+                scanned[group_key][1],
+                scanned[group_key][0],
+                "final" not in normalize_header(group_key[1]),
+                sum(path.stat().st_size for path in candidate_groups[group_key]),
             ),
         )
+        selected_paths = sorted(candidate_groups[selected_key], key=fastq_split_sort_key)
         record = records[barcode]
         record["barcode"] = barcode
-        record["raw_fastq"] = selected
-        if len(paths) > 1:
-            ignored = [str(path) for path in sorted(paths) if path != selected]
+        record["raw_fastq"] = selected_paths
+        if len(selected_paths) > 1:
             record.setdefault("input_warnings", []).append(
-                "multiple raw FASTQ files detected; using largest file "
-                f"{selected} and ignoring {', '.join(ignored)}"
+                "split raw FASTQ set detected; aggregating files "
+                f"{describe_path_list(selected_paths)}"
+            )
+        ignored_paths = [
+            path
+            for group_key, group_paths in sorted(candidate_groups.items(), key=lambda item: (str(item[0][0]), item[0][1]))
+            if group_key != selected_key
+            for path in sorted(group_paths, key=fastq_split_sort_key)
+        ]
+        if ignored_paths:
+            record.setdefault("input_warnings", []).append(
+                "multiple raw FASTQ inputs detected; using largest eligible set "
+                f"{describe_path_list(selected_paths)} and ignoring {describe_path_list(ignored_paths)}"
             )
 
 
@@ -1056,12 +1154,13 @@ def read_lengths_by_name_from_bam(bam_path: Path) -> dict[str, int]:
     return lengths
 
 
-def read_lengths_by_name_from_fastq(fastq_path: Path) -> dict[str, int]:
+def read_lengths_by_name_from_fastq(fastq_path: Path | list[Path]) -> dict[str, int]:
     lengths = {}
-    for read_name, read_length in iter_fastq_read_lengths(fastq_path):
-        if read_name in lengths:
-            raise ValueError(f"Duplicate FASTQ read name in {fastq_path}: {read_name!r}")
-        lengths[read_name] = read_length
+    for path in normalize_path_list(fastq_path):
+        for read_name, read_length in iter_fastq_read_lengths(path):
+            if read_name in lengths:
+                raise ValueError(f"Duplicate FASTQ read name across raw FASTQ input set: {read_name!r}")
+            lengths[read_name] = read_length
     return lengths
 
 
@@ -1104,7 +1203,7 @@ def plot_pdf_coverage_map(per_base_csv: Path, low_conf_csv: Path, out_path: Path
 
 
 def plot_read_length_vs_bases(
-    raw_reads_path: Path,
+    raw_reads_path: Path | list[Path],
     aligned_bam: Path,
     contig_length: int,
     out_path: Path,
@@ -1738,18 +1837,20 @@ def package_sample(
     fasta_path = record["fasta"]
     gbk_path = record["gbk"]
     bam_path = record.get("bam")
-    raw_fastq_path = record.get("raw_fastq")
+    raw_fastq_value = record.get("raw_fastq")
     fastq_path = record.get("fastq")
     maf_path = record.get("maf")
     if not isinstance(fasta_path, Path) or not isinstance(gbk_path, Path):
         raise ValueError(f"record {record_id} has invalid required file paths")
     if bam_path is not None and not isinstance(bam_path, Path):
         raise ValueError(f"record {record_id} has invalid BAM path")
-    if raw_fastq_path is not None and not isinstance(raw_fastq_path, Path):
+    try:
+        raw_fastq_paths = normalize_path_list(raw_fastq_value)
+    except ValueError:
         raise ValueError(f"record {record_id} has invalid raw FASTQ path")
     if use_bam and bam_path is None:
         raise ValueError(f"record {record_id} needs a BAM file when --use-bam is set")
-    if not use_bam and raw_fastq_path is None:
+    if not use_bam and not raw_fastq_paths:
         detail = record.get("raw_fastq_error") or "no appropriately sized raw FASTQ was detected"
         raise ValueError(f"record {record_id} needs a raw FASTQ unless --use-bam is set: {detail}")
     if fastq_path is not None and not isinstance(fastq_path, Path):
@@ -1776,9 +1877,9 @@ def package_sample(
     rewrite_genbank_locus(gbk_path, gbk_out, sequence_name)
 
     alignment_dir = work_dir / "alignment"
-    if raw_fastq_path is not None and not use_bam:
+    if raw_fastq_paths and not use_bam:
         alignment_result = run_fastq_pipeline(
-            raw_fastq_path,
+            raw_fastq_paths,
             fasta_out,
             alignment_dir,
             minimap2_preset="map-ont",
@@ -1786,7 +1887,7 @@ def package_sample(
             sort_memory=sort_memory,
             keep_intermediates=keep_intermediates,
         )
-        raw_reads_path = raw_fastq_path
+        raw_reads_path = raw_fastq_paths
         raw_reads_format = "fastq"
     else:
         assert isinstance(bam_path, Path)
@@ -1811,9 +1912,9 @@ def package_sample(
     input_warnings = record.get("input_warnings")
     if isinstance(input_warnings, list):
         warnings.extend(str(warning) for warning in input_warnings)
-    if raw_fastq_path is not None and not use_bam:
-        warnings.append(f"using raw FASTQ for alignment and read metrics: {raw_fastq_path}")
-    if raw_fastq_path is not None and use_bam:
+    if raw_fastq_paths and not use_bam:
+        warnings.append(f"using raw FASTQ for alignment and read metrics: {describe_path_list(raw_fastq_paths)}")
+    if raw_fastq_paths and use_bam:
         warnings.append(f"raw FASTQ detected but --use-bam requested; using BAM for alignment and read metrics: {bam_path}")
     if record.get("mixed_contig_count"):
         warnings.append(
@@ -1824,9 +1925,9 @@ def package_sample(
     host_contamination_pct = None
     host_aligned_bam = None
     if DEFAULT_ECOLI_REFERENCE_FASTA.exists():
-        if raw_fastq_path is not None and not use_bam:
+        if raw_fastq_paths and not use_bam:
             host_alignment_result = run_fastq_pipeline(
-                raw_fastq_path,
+                raw_fastq_paths,
                 DEFAULT_ECOLI_REFERENCE_FASTA,
                 work_dir / "host_alignment",
                 minimap2_preset="map-ont",
@@ -1919,7 +2020,7 @@ def package_sample(
                 "paths": {
                     "order_dir": str(order_dir),
                     "pdf": str(pdf_out),
-                    "alignment_input": str(raw_reads_path),
+                    "alignment_input": serialize_path_value(raw_reads_path),
                     "alignment_input_type": raw_reads_format,
                     "fasta": str(fasta_out),
                     "gbk": str(gbk_out),
@@ -1963,7 +2064,9 @@ def parse_args() -> argparse.Namespace:
             "Mixed-contig samples may use barcodeXX.contig001.final.fasta/fa and matching contig labels on related files. "
             "Missing consensus FASTQ files warn but do not stop packaging. "
             "BAMs may be directly inside it or inside barcodeXX subfolders. "
-            "Raw FASTQ/FASTQ.GZ files with barcode tokens are required for alignment by default; pass --use-bam to force BAM input."
+            "Raw FASTQ/FASTQ.GZ files with barcode tokens are required for alignment by default. "
+            "Numbered split FASTQs with the same base name are aggregated. "
+            "Pass --use-bam to force BAM input."
         ),
     )
     parser.add_argument(
@@ -2012,7 +2115,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Use BAM files for alignment, host DNA, read-length distribution, and multimer metrics even when "
-            "larger raw FASTQ/FASTQ.GZ files are detected. By default, an appropriately sized barcoded FASTQ is required."
+            "larger raw FASTQ/FASTQ.GZ input sets are detected. By default, an appropriately sized barcoded "
+            "FASTQ input set is required."
         ),
     )
     parser.add_argument(
