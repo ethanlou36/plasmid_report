@@ -1585,7 +1585,7 @@ def multimer_pdf_table(assembly: dict) -> tuple[list[str], list[float | None], l
         ("tetramer_pct", "Tetramer"),
     ]
     if assembly.get("multimer_denominator") == MULTIMER_DENOMINATOR_ALL_ELIGIBLE_READS:
-        required.append(("unclassified_multimer_read_pct", "Unclassified"))
+        required.append(("unclassified_multimer_base_pct", "Unclassified"))
 
     missing = [key for key, _label in required if key not in assembly]
     if missing:
@@ -2126,7 +2126,8 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Denominator for monomer/dimer/trimer/tetramer percentages. "
             "classified-reads reports percentages only among reads classified as 1x-4x; "
-            "all-eligible-reads includes unclassified eligible mapped reads in the denominator."
+            "all-eligible-reads includes unclassified eligible mapped reads in the denominator. "
+            "PDF table percentages are base-weighted."
         ),
     )
     return parser.parse_args()

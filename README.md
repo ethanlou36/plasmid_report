@@ -179,7 +179,7 @@ python3 epi2me_to_final_package.py \
   omitted, the output goes into `C:\WPS data\<folder-name>\output\`.
 - `--barcodes 1 2` limits the run to barcode01 and barcode02. Omit this option to process every barcode found.
 - `--multimer-denominator classified-reads` reports monomer/dimer/trimer/tetramer percentages only among reads that were close enough to 1x/2x/3x/4x plasmid length to classify. This is the default.
-- `--multimer-denominator all-eligible-reads` includes eligible mapped reads that were not classifiable and adds an `Unclassified` column to the multimer table.
+- `--multimer-denominator all-eligible-reads` includes eligible mapped reads that were not classifiable and adds a base-weighted `Unclassified` column to the multimer table.
 - `--use-bam` uses BAM files for alignment, host DNA, read-length distribution, and multimer metrics even when a raw FASTQ/FASTQ.GZ file is detected.
 - `--threads 4` makes alignment faster.
 - `--sort-memory 1G` gives `samtools sort` more memory.
@@ -208,6 +208,9 @@ By default, the raw reads come from the largest appropriately sized barcoded
 FASTQ/FASTQ.GZ input set. Numbered split FASTQs with the same base name are
 aggregated before alignment and read-length metrics are calculated. Pass
 `--use-bam` to force BAM input.
+
+Coverage depth and per-base CSV values use primary, non-supplementary
+alignments, matching the read set used for the reported mapped-bases summary.
 
 It is okay to reuse the same `--output-dir`. If the same barcode is run again,
 the script removes the previous files for that barcode and writes fresh ones.

@@ -8,7 +8,7 @@ pos,base,depth,match_count,vaf,G,A,T,C,ins,del,qscore,confidence
 This follows the example report semantics:
 - covered positions only by default
 - base is the majority observed nucleotide at each position
-- depth includes deletion-supporting reads
+- depth uses primary, non-supplementary alignments and includes deletion-supporting reads
 - vaf = match_count / depth
 - qscore = mean BAM base quality for reads supporting the called base
 """
@@ -186,6 +186,10 @@ def build_row(
     filtered_low_quality_count = 0
 
     for pileup_read in pileup_column.pileups:
+        read = pileup_read.alignment
+        if read.is_secondary or read.is_supplementary:
+            continue
+
         if pileup_read.is_refskip:
             refskip_count += 1
             continue
@@ -199,7 +203,6 @@ def build_row(
         if query_pos is None:
             continue
 
-        read = pileup_read.alignment
         query_sequence = read.query_sequence
         if not query_sequence or query_pos >= len(query_sequence):
             continue

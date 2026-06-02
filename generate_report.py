@@ -861,7 +861,8 @@ def main():
         help=(
             "Denominator for monomer/dimer/trimer/tetramer percentages. "
             "classified-reads reports percentages only among reads classified as 1x-4x; "
-            "all-eligible-reads includes unclassified eligible mapped reads in the denominator."
+            "all-eligible-reads includes unclassified eligible mapped reads in the denominator. "
+            "Reported multimer percentages are base-weighted."
         ),
     )
     args = parser.parse_args()
