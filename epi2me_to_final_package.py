@@ -5,7 +5,7 @@ Build customer-facing WPS order folders from an EPI2ME export.
 This workflow:
 1. discovers per-barcode EPI2ME files
 2. maps barcodes to customer metadata
-3. realigns raw unmapped BAM reads to the final consensus FASTA
+3. realigns raw FASTQ reads, or raw unmapped BAM reads, to the final consensus FASTA
 4. generates per-base CSVs, QC plots, and synthetic AB1 files
 5. writes a customer-ready package grouped by order number
 6. renders a 2-page PDF report with an Alta-style layout
@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import gzip
 import json
 import math
 import os
@@ -43,7 +44,7 @@ from matplotlib.patches import Patch, PathPatch, Rectangle
 import numpy as np
 import pysam
 
-from align_bam_pipeline import run_pipeline
+from align_bam_pipeline import run_fastq_pipeline, run_pipeline
 from fastq_to_ab1 import phred_from_ascii, synthesize_chromatogram, write_real_ab1
 from generate_report import (
     DEFAULT_MULTIMER_DENOMINATOR,
@@ -108,6 +109,8 @@ DEFAULT_LOGO_PATH = Path(__file__).resolve().with_name("Alta Biotech Logo.jpg")
 DEFAULT_ECOLI_REFERENCE_FASTA = Path(__file__).resolve().with_name("E. Coli Genome.fna")
 HOST_DNA_MIN_ALIGNED_BP = 1300
 HOST_DNA_MIN_ALIGNED_PCT = 91.0
+RAW_FASTQ_MIN_BYTES = 100_000
+RAW_FASTQ_MIN_RECORDS = 100
 
 
 def slugify(value: str) -> str:
@@ -553,6 +556,57 @@ def match_barcode_file(path: Path, extensions: set[str], required_terms: set[str
     return barcode_from_filename(path)
 
 
+def is_fastq_path(path: Path) -> bool:
+    name = path.name.lower()
+    return name.endswith((".fastq", ".fq", ".fastq.gz", ".fq.gz"))
+
+
+def infer_fastq_barcode(path: Path) -> str | None:
+    barcode = barcode_from_filename(path)
+    if barcode is not None:
+        return barcode
+    for parent in path.parents:
+        if re.fullmatch(r"barcode\d+", parent.name, re.IGNORECASE):
+            return normalize_barcode(parent.name)
+    return None
+
+
+def count_fastq_records_up_to(path: Path, limit: int) -> int:
+    count = 0
+    with open_fastq_text(path) as handle:
+        while count < limit:
+            header = handle.readline().rstrip("\n\r")
+            if not header:
+                break
+            seq = handle.readline().rstrip("\n\r")
+            plus = handle.readline().rstrip("\n\r")
+            qual = handle.readline().rstrip("\n\r")
+            if not header.startswith("@") or not plus.startswith("+") or len(seq) != len(qual):
+                raise ValueError(f"Malformed FASTQ record in {path}")
+            count += 1
+    return count
+
+
+def raw_fastq_rejection_reason(path: Path) -> str | None:
+    size = path.stat().st_size
+    if size < RAW_FASTQ_MIN_BYTES:
+        return f"{path} is only {size:,} bytes; expected at least {RAW_FASTQ_MIN_BYTES:,} bytes"
+    try:
+        record_count = count_fastq_records_up_to(path, RAW_FASTQ_MIN_RECORDS)
+    except ValueError as exc:
+        return str(exc)
+    if record_count < RAW_FASTQ_MIN_RECORDS:
+        return f"{path} has only {record_count} FASTQ records; expected at least {RAW_FASTQ_MIN_RECORDS}"
+    return None
+
+
+def should_skip_discovered_input(path: Path, resolved_excludes: Iterable[Path]) -> bool:
+    resolved_path = path.resolve()
+    if any(path_is_inside(resolved_path, excluded) for excluded in resolved_excludes):
+        return True
+    return any(parent.name == "_work" or parent.name.startswith("WPS Data_Order #") for parent in path.parents)
+
+
 def infer_bam_barcode(path: Path) -> tuple[str | None, str | None]:
     filename_barcodes = sorted(
         {
@@ -600,10 +654,7 @@ def discover_bam_files(
     for path in directory.rglob("*.bam"):
         if not path.is_file():
             continue
-        resolved_path = path.resolve()
-        if any(path_is_inside(resolved_path, excluded) for excluded in resolved_excludes):
-            continue
-        if any(parent.name == "_work" or parent.name.startswith("WPS Data_Order #") for parent in path.parents):
+        if should_skip_discovered_input(path, resolved_excludes):
             continue
         barcode, error = infer_bam_barcode(path)
         if error:
@@ -614,6 +665,66 @@ def discover_bam_files(
         grouped[barcode].append(path)
     for barcode, paths in sorted(grouped.items()):
         add_grouped_discovered_files(records, discovery_errors, barcode, "bam", paths)
+
+
+def discover_raw_fastq_files(
+    records: dict[str, dict[str, object]],
+    directory: Path,
+    exclude_dirs: Iterable[Path] | None = None,
+) -> None:
+    if not directory.exists():
+        raise ValueError(f"raw FASTQ directory does not exist: {directory}")
+    if not directory.is_dir():
+        raise ValueError(f"raw FASTQ path is not a directory: {directory}")
+
+    resolved_excludes = [
+        path.resolve()
+        for path in (exclude_dirs or [])
+        if path.resolve() != directory.resolve()
+    ]
+
+    grouped: dict[str, list[Path]] = defaultdict(list)
+    for path in directory.rglob("*"):
+        if not path.is_file() or not is_fastq_path(path):
+            continue
+        if should_skip_discovered_input(path, resolved_excludes):
+            continue
+        barcode = infer_fastq_barcode(path)
+        if barcode is None:
+            continue
+        grouped[barcode].append(path)
+
+    for barcode, paths in sorted(grouped.items()):
+        rejected = {
+            path: reason
+            for path in sorted(paths)
+            if (reason := raw_fastq_rejection_reason(path)) is not None
+        }
+        eligible_paths = [path for path in sorted(paths) if path not in rejected]
+        if not eligible_paths:
+            record = records[barcode]
+            record["barcode"] = barcode
+            details = "; ".join(rejected[path] for path in sorted(rejected))
+            record["raw_fastq_error"] = (
+                f"no appropriately sized raw FASTQ found for {barcode}; {details}"
+                if details
+                else f"no appropriately sized raw FASTQ found for {barcode}"
+            )
+            continue
+
+        selected = max(
+            eligible_paths,
+            key=lambda path: (path.stat().st_size, "final" not in normalize_header(path.stem)),
+        )
+        record = records[barcode]
+        record["barcode"] = barcode
+        record["raw_fastq"] = selected
+        if len(paths) > 1:
+            ignored = [str(path) for path in sorted(paths) if path != selected]
+            record.setdefault("input_warnings", []).append(
+                "multiple raw FASTQ files detected; using largest file "
+                f"{selected} and ignoring {', '.join(ignored)}"
+            )
 
 
 def expand_shared_barcode_files(records: dict[str, dict[str, object]]) -> dict[str, dict[str, object]]:
@@ -631,12 +742,16 @@ def expand_shared_barcode_files(records: dict[str, dict[str, object]]) -> dict[s
         shared_record = expanded.get(barcode)
         if not shared_record:
             continue
-        for key in ("bam", "fastq", "maf"):
+        for key in ("bam", "fastq", "raw_fastq", "maf"):
             shared_value = shared_record.get(key)
             if shared_value is None:
                 continue
             for record_id in contig_record_ids:
                 expanded[record_id].setdefault(key, shared_value)
+        shared_warnings = shared_record.get("input_warnings")
+        if isinstance(shared_warnings, list):
+            for record_id in contig_record_ids:
+                expanded[record_id].setdefault("input_warnings", []).extend(shared_warnings)
         if not any(key in shared_record for key in ("fasta", "gbk")):
             expanded.pop(barcode, None)
     return expanded
@@ -735,6 +850,7 @@ def discover_input_records(
             fastq_dir,
             lambda path: match_barcode_file(path, {".fastq", ".fq"}, {"final"}),
         )
+        discover_raw_fastq_files(records, fastq_dir, exclude_dirs=exclude_dirs)
     if maf_dir is not None:
         discover_files_for_key(
             records,
@@ -825,6 +941,26 @@ def parse_fastq_record(path: Path) -> tuple[str, str, str]:
     return header[1:], seq.upper(), qual
 
 
+def open_fastq_text(path: Path):
+    if path.name.lower().endswith(".gz"):
+        return gzip.open(path, "rt", encoding="ascii", errors="replace")
+    return path.open("r", encoding="ascii", errors="replace")
+
+
+def iter_fastq_read_lengths(path: Path):
+    with open_fastq_text(path) as handle:
+        while True:
+            header = handle.readline().rstrip("\n\r")
+            if not header:
+                break
+            seq = handle.readline().rstrip("\n\r")
+            plus = handle.readline().rstrip("\n\r")
+            qual = handle.readline().rstrip("\n\r")
+            if not header.startswith("@") or not plus.startswith("+") or len(seq) != len(qual):
+                raise ValueError(f"Malformed FASTQ record in {path}")
+            yield header[1:].split()[0], len(seq)
+
+
 def generate_ab1_files(
     fasta_path: Path,
     fastq_path: Path | None,
@@ -881,6 +1017,28 @@ def read_lengths_from_bam(bam_path: Path) -> list[int]:
     return lengths
 
 
+def read_lengths_by_name_from_bam(bam_path: Path) -> dict[str, int]:
+    lengths = {}
+    with pysam.AlignmentFile(bam_path, "rb", check_sq=False) as bam:
+        for read in bam.fetch(until_eof=True):
+            if read.is_secondary or read.is_supplementary:
+                continue
+            read_name = read.query_name or ""
+            if read_name in lengths:
+                raise ValueError(f"Duplicate primary read name in raw BAM: {read_name!r}")
+            lengths[read_name] = read.query_length or 0
+    return lengths
+
+
+def read_lengths_by_name_from_fastq(fastq_path: Path) -> dict[str, int]:
+    lengths = {}
+    for read_name, read_length in iter_fastq_read_lengths(fastq_path):
+        if read_name in lengths:
+            raise ValueError(f"Duplicate FASTQ read name in {fastq_path}: {read_name!r}")
+        lengths[read_name] = read_length
+    return lengths
+
+
 def plot_pdf_coverage_map(per_base_csv: Path, low_conf_csv: Path, out_path: Path) -> Path:
     positions = []
     depths = []
@@ -919,7 +1077,13 @@ def plot_pdf_coverage_map(per_base_csv: Path, low_conf_csv: Path, out_path: Path
     return out_path
 
 
-def plot_read_length_vs_bases(raw_bam: Path, aligned_bam: Path, contig_length: int, out_path: Path) -> Path:
+def plot_read_length_vs_bases(
+    raw_reads_path: Path,
+    aligned_bam: Path,
+    contig_length: int,
+    out_path: Path,
+    raw_reads_format: str = "bam",
+) -> Path:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     mapped_names = set()
     with pysam.AlignmentFile(aligned_bam, "rb") as bam:
@@ -935,24 +1099,22 @@ def plot_read_length_vs_bases(raw_bam: Path, aligned_bam: Path, contig_length: i
                 continue
             mapped_names.add(read_name)
 
+    if raw_reads_format == "bam":
+        raw_lengths_by_name = read_lengths_by_name_from_bam(raw_reads_path)
+    elif raw_reads_format == "fastq":
+        raw_lengths_by_name = read_lengths_by_name_from_fastq(raw_reads_path)
+    else:
+        raise ValueError(f"Unsupported raw read format: {raw_reads_format}")
+
     mapped_lengths = []
     other_lengths = []
-    with pysam.AlignmentFile(raw_bam, "rb", check_sq=False) as bam:
-        seen_raw_names = set()
-        for read in bam.fetch(until_eof=True):
-            if read.is_secondary or read.is_supplementary:
-                continue
-            read_name = read.query_name or ""
-            if read_name in seen_raw_names:
-                raise ValueError(f"Duplicate primary read name in raw BAM: {read_name!r}")
-            seen_raw_names.add(read_name)
-            qlen = read.query_length or 0
-            if qlen <= READ_LENGTH_DISTRIBUTION_MIN_DISPLAY_BP:
-                continue
-            if read_name in mapped_names:
-                mapped_lengths.append(qlen)
-            else:
-                other_lengths.append(qlen)
+    for read_name, qlen in raw_lengths_by_name.items():
+        if qlen <= READ_LENGTH_DISTRIBUTION_MIN_DISPLAY_BP:
+            continue
+        if read_name in mapped_names:
+            mapped_lengths.append(qlen)
+        else:
+            other_lengths.append(qlen)
 
     all_lengths = mapped_lengths + other_lengths
     fig, ax = plt.subplots(figsize=(7.6, 3.7))
@@ -1151,7 +1313,13 @@ def draw_table(fig, bbox, headers, values, col_widths=None) -> None:
     for line in grid_lines:
         line.set_clip_path(rounded_border)
 
-    for x_center, header, value in zip(centers, headers, values):
+    def value_font_size(text: str, col_width: float) -> float:
+        char_capacity = max(1.0, col_width * 88.0)
+        if len(text) <= char_capacity:
+            return 9.2
+        return max(6.2, 9.2 * char_capacity / len(text))
+
+    for x_center, width, header, value in zip(centers, col_widths, headers, values):
         ax.text(
             x_center,
             0.74,
@@ -1169,7 +1337,7 @@ def draw_table(fig, bbox, headers, values, col_widths=None) -> None:
             value,
             ha="center",
             va="center",
-            fontsize=9.2,
+            fontsize=value_font_size(str(value), width),
             color="#333333",
             wrap=True,
         )
@@ -1341,7 +1509,7 @@ def render_pdf_report(
                 metadata.get("order_number", "UNKNOWN"),
                 report_date_value(metadata),
             ],
-            col_widths=[0.40, 0.18, 0.22, 0.20],
+            col_widths=[0.52, 0.12, 0.18, 0.18],
         )
 
         draw_section_heading(fig, 0.615, "Assembly Summary")
@@ -1526,6 +1694,7 @@ def package_sample(
     sort_memory: str = "768M",
     keep_intermediates: bool = False,
     allow_aligned_input: bool = False,
+    use_bam: bool = False,
     multimer_denominator: str = DEFAULT_MULTIMER_DENOMINATOR,
 ) -> dict[str, object]:
     barcode = record.get("barcode")
@@ -1542,11 +1711,21 @@ def package_sample(
         raise ValueError("metadata is missing order_number; refusing to package under WPS Data_Order #UNKNOWN")
     fasta_path = record["fasta"]
     gbk_path = record["gbk"]
-    bam_path = record["bam"]
+    bam_path = record.get("bam")
+    raw_fastq_path = record.get("raw_fastq")
     fastq_path = record.get("fastq")
     maf_path = record.get("maf")
-    if not isinstance(fasta_path, Path) or not isinstance(gbk_path, Path) or not isinstance(bam_path, Path):
+    if not isinstance(fasta_path, Path) or not isinstance(gbk_path, Path):
         raise ValueError(f"record {record_id} has invalid required file paths")
+    if bam_path is not None and not isinstance(bam_path, Path):
+        raise ValueError(f"record {record_id} has invalid BAM path")
+    if raw_fastq_path is not None and not isinstance(raw_fastq_path, Path):
+        raise ValueError(f"record {record_id} has invalid raw FASTQ path")
+    if use_bam and bam_path is None:
+        raise ValueError(f"record {record_id} needs a BAM file when --use-bam is set")
+    if not use_bam and raw_fastq_path is None:
+        detail = record.get("raw_fastq_error") or "no appropriately sized raw FASTQ was detected"
+        raise ValueError(f"record {record_id} needs a raw FASTQ unless --use-bam is set: {detail}")
     if fastq_path is not None and not isinstance(fastq_path, Path):
         raise ValueError(f"record {record_id} has invalid FASTQ path")
     if maf_path is not None and not isinstance(maf_path, Path):
@@ -1571,22 +1750,45 @@ def package_sample(
     rewrite_genbank_locus(gbk_path, gbk_out, sequence_name)
 
     alignment_dir = work_dir / "alignment"
-    alignment_result = run_pipeline(
-        bam_path,
-        fasta_out,
-        alignment_dir,
-        minimap2_preset="map-ont",
-        threads=threads,
-        sort_memory=sort_memory,
-        keep_intermediates=keep_intermediates,
-        allow_aligned_input=allow_aligned_input,
-    )
+    if raw_fastq_path is not None and not use_bam:
+        alignment_result = run_fastq_pipeline(
+            raw_fastq_path,
+            fasta_out,
+            alignment_dir,
+            minimap2_preset="map-ont",
+            threads=threads,
+            sort_memory=sort_memory,
+            keep_intermediates=keep_intermediates,
+        )
+        raw_reads_path = raw_fastq_path
+        raw_reads_format = "fastq"
+    else:
+        assert isinstance(bam_path, Path)
+        alignment_result = run_pipeline(
+            bam_path,
+            fasta_out,
+            alignment_dir,
+            minimap2_preset="map-ont",
+            threads=threads,
+            sort_memory=sort_memory,
+            keep_intermediates=keep_intermediates,
+            allow_aligned_input=allow_aligned_input,
+        )
+        raw_reads_path = bam_path
+        raw_reads_format = "bam"
     aligned_bam = Path(alignment_result["sorted_bam"])
     fasta_index = Path(f"{fasta_out}.fai")
     if fasta_index.exists():
         fasta_index.unlink()
 
     warnings = validate_expected_fastq(record)
+    input_warnings = record.get("input_warnings")
+    if isinstance(input_warnings, list):
+        warnings.extend(str(warning) for warning in input_warnings)
+    if raw_fastq_path is not None and not use_bam:
+        warnings.append(f"using raw FASTQ for alignment and read metrics: {raw_fastq_path}")
+    if raw_fastq_path is not None and use_bam:
+        warnings.append(f"raw FASTQ detected but --use-bam requested; using BAM for alignment and read metrics: {bam_path}")
     if record.get("mixed_contig_count"):
         warnings.append(
             "multiple contigs detected; report generated from primary contig "
@@ -1596,16 +1798,28 @@ def package_sample(
     host_contamination_pct = None
     host_aligned_bam = None
     if DEFAULT_ECOLI_REFERENCE_FASTA.exists():
-        host_alignment_result = run_pipeline(
-            bam_path,
-            DEFAULT_ECOLI_REFERENCE_FASTA,
-            work_dir / "host_alignment",
-            minimap2_preset="map-ont",
-            threads=threads,
-            sort_memory=sort_memory,
-            keep_intermediates=keep_intermediates,
-            allow_aligned_input=allow_aligned_input,
-        )
+        if raw_fastq_path is not None and not use_bam:
+            host_alignment_result = run_fastq_pipeline(
+                raw_fastq_path,
+                DEFAULT_ECOLI_REFERENCE_FASTA,
+                work_dir / "host_alignment",
+                minimap2_preset="map-ont",
+                threads=threads,
+                sort_memory=sort_memory,
+                keep_intermediates=keep_intermediates,
+            )
+        else:
+            assert isinstance(bam_path, Path)
+            host_alignment_result = run_pipeline(
+                bam_path,
+                DEFAULT_ECOLI_REFERENCE_FASTA,
+                work_dir / "host_alignment",
+                minimap2_preset="map-ont",
+                threads=threads,
+                sort_memory=sort_memory,
+                keep_intermediates=keep_intermediates,
+                allow_aligned_input=allow_aligned_input,
+            )
         host_bam = Path(host_alignment_result["sorted_bam"])
         host_aligned_bam = str(host_bam)
         host_contamination_details = compute_host_dna_from_alignment(host_bam)
@@ -1643,10 +1857,11 @@ def package_sample(
     ab1_paths = generate_ab1_files(fasta_out, fastq_path, package_dirs["ab1"], output_stem)
 
     bases_plot = plot_read_length_vs_bases(
-        bam_path,
+        raw_reads_path,
         aligned_bam,
         renamed["length_bp"],
         work_dir / "read_length_vs_bases.png",
+        raw_reads_format=raw_reads_format,
     )
 
     pdf_out = package_dirs["qc"] / f"{sample_stem}_report.pdf"
@@ -1678,6 +1893,8 @@ def package_sample(
                 "paths": {
                     "order_dir": str(order_dir),
                     "pdf": str(pdf_out),
+                    "alignment_input": str(raw_reads_path),
+                    "alignment_input_type": raw_reads_format,
                     "fasta": str(fasta_out),
                     "gbk": str(gbk_out),
                     "ab1": [str(path) for path in ab1_paths],
@@ -1718,8 +1935,9 @@ def parse_args() -> argparse.Namespace:
             "barcodeXX.final.fasta/fa, barcodeXX.annotations.gbk, raw/unmapped BAMs, "
             "barcodeXX.final.fastq/fq, optional MAF files, and exactly one WPS Working Sheet metadata CSV, TSV, or XLSX file. "
             "Mixed-contig samples may use barcodeXX.contig001.final.fasta/fa and matching contig labels on related files. "
-            "Missing FASTQ files warn but do not stop packaging. "
-            "BAMs may be directly inside it or inside barcodeXX subfolders."
+            "Missing consensus FASTQ files warn but do not stop packaging. "
+            "BAMs may be directly inside it or inside barcodeXX subfolders. "
+            "Raw FASTQ/FASTQ.GZ files with barcode tokens are required for alignment by default; pass --use-bam to force BAM input."
         ),
     )
     parser.add_argument(
@@ -1762,6 +1980,14 @@ def parse_args() -> argparse.Namespace:
         "--allow-aligned-input",
         action="store_true",
         help="Allow BAMs that already contain mapped primary reads.",
+    )
+    parser.add_argument(
+        "--use-bam",
+        action="store_true",
+        help=(
+            "Use BAM files for alignment, host DNA, read-length distribution, and multimer metrics even when "
+            "larger raw FASTQ/FASTQ.GZ files are detected. By default, an appropriately sized barcoded FASTQ is required."
+        ),
     )
     parser.add_argument(
         "--multimer-denominator",
@@ -1853,7 +2079,13 @@ def main() -> None:
             continue
         if metadata_lookup and barcode not in metadata_lookup:
             continue
-        missing = [key for key in ("fasta", "gbk", "bam") if key not in record]
+        missing = [key for key in ("fasta", "gbk") if key not in record]
+        if args.use_bam:
+            if "bam" not in record:
+                missing.append("bam")
+        elif "raw_fastq" not in record:
+            detail = record.get("raw_fastq_error") or "no appropriately sized raw FASTQ was detected"
+            raise ValueError(f"{barcode}: {detail}. Pass --use-bam to force BAM input.")
         if missing:
             skipped.append({"barcode": barcode, "record_id": record_id, "reason": f"missing required files: {', '.join(missing)}"})
             continue
@@ -1870,6 +2102,7 @@ def main() -> None:
                     sort_memory=args.sort_memory,
                     keep_intermediates=args.keep_intermediates,
                     allow_aligned_input=args.allow_aligned_input,
+                    use_bam=args.use_bam,
                     multimer_denominator=args.multimer_denominator,
                 )
             )

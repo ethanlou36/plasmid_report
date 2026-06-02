@@ -14,6 +14,7 @@ Pipeline:
 """
 
 import argparse
+import gzip
 import hashlib
 from pathlib import Path
 import shutil
@@ -56,6 +57,36 @@ def inspect_bam_input(bam_path):
     return {
         "primary_reads": primary_reads,
         "mapped_primary_reads": mapped_primary_reads,
+    }
+
+
+def open_fastq_text(path):
+    path = Path(path)
+    if path.name.lower().endswith(".gz"):
+        return gzip.open(path, "rt", encoding="ascii", errors="replace")
+    return path.open("r", encoding="ascii", errors="replace")
+
+
+def inspect_fastq_input(fastq_path):
+    records = 0
+    bases = 0
+    with open_fastq_text(fastq_path) as handle:
+        while True:
+            header = handle.readline()
+            if not header:
+                break
+            seq = handle.readline().rstrip("\n\r")
+            plus = handle.readline()
+            qual = handle.readline().rstrip("\n\r")
+            if not plus or not header.startswith("@") or not plus.startswith("+") or len(seq) != len(qual):
+                raise ValueError(f"Malformed FASTQ record in {fastq_path}")
+            records += 1
+            bases += len(seq)
+    if records == 0:
+        raise ValueError(f"No FASTQ records found in {fastq_path}")
+    return {
+        "primary_reads": records,
+        "total_bases": bases,
     }
 
 
@@ -113,15 +144,15 @@ def remove_intermediates(paths):
     return removed
 
 
-def run_pipeline(
-    bam_path,
+def align_fastq_to_reference(
+    reads_fastq,
     reference_path,
     out_dir,
     minimap2_preset="map-ont",
     threads=1,
     sort_memory="768M",
     keep_intermediates=False,
-    allow_aligned_input=False,
+    removable_intermediates=(),
 ):
     minimap2 = require_tool("minimap2")
     samtools = require_tool("samtools")
@@ -131,14 +162,6 @@ def run_pipeline(
     if not str(sort_memory).strip():
         raise ValueError("sort_memory must be a non-empty samtools memory value, for example 768M or 2G")
 
-    bam_stats = inspect_bam_input(bam_path)
-    if bam_stats["mapped_primary_reads"] and not allow_aligned_input:
-        raise ValueError(
-            f"Input BAM appears to contain {bam_stats['mapped_primary_reads']} already-mapped primary reads. "
-            "This pipeline expects raw/unaligned MinKNOW BAM input. Pass allow_aligned_input=True "
-            "or --allow-aligned-input only if you intentionally want to realign these reads."
-        )
-
     reference_path = Path(reference_path)
     if reference_path.suffix.lower() not in {".fa", ".fasta", ".fna"}:
         raise ValueError("Reference must be a FASTA file (.fa, .fasta, or .fna)")
@@ -146,12 +169,10 @@ def run_pipeline(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    reads_fastq = out_dir / "reads.fastq"
     sam_path = out_dir / "aligned.sam"
     unsorted_bam = out_dir / "aligned.unsorted.bam"
     sorted_bam = out_dir / "aligned.sorted.bam"
 
-    bam_to_fastq(samtools, bam_path, reads_fastq)
     index_reference_fasta(samtools, reference_path)
 
     with open(sam_path, "wb") as sam_handle:
@@ -198,7 +219,7 @@ def run_pipeline(
     aligned_reads = count_alignment_records(samtools, sorted_bam, mapped_only=True, threads=threads)
     sam_reads = count_alignment_records(samtools, sorted_bam, threads=threads)
 
-    intermediates = [reads_fastq, sam_path, unsorted_bam]
+    intermediates = [*removable_intermediates, sam_path, unsorted_bam]
     removed_intermediates = [] if keep_intermediates else remove_intermediates(intermediates)
 
     return {
@@ -214,11 +235,81 @@ def run_pipeline(
         "aligner": "minimap2",
         "threads": threads,
         "sort_memory": str(sort_memory),
-        "input_primary_reads": bam_stats["primary_reads"],
-        "input_mapped_primary_reads": bam_stats["mapped_primary_reads"],
         "intermediates_kept": keep_intermediates,
         "intermediates_removed": removed_intermediates,
     }
+
+
+def run_pipeline(
+    bam_path,
+    reference_path,
+    out_dir,
+    minimap2_preset="map-ont",
+    threads=1,
+    sort_memory="768M",
+    keep_intermediates=False,
+    allow_aligned_input=False,
+):
+    bam_stats = inspect_bam_input(bam_path)
+    if bam_stats["mapped_primary_reads"] and not allow_aligned_input:
+        raise ValueError(
+            f"Input BAM appears to contain {bam_stats['mapped_primary_reads']} already-mapped primary reads. "
+            "This pipeline expects raw/unaligned MinKNOW BAM input. Pass allow_aligned_input=True "
+            "or --allow-aligned-input only if you intentionally want to realign these reads."
+        )
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    reads_fastq = out_dir / "reads.fastq"
+    bam_to_fastq(None, bam_path, reads_fastq)
+    result = align_fastq_to_reference(
+        reads_fastq,
+        reference_path,
+        out_dir,
+        minimap2_preset=minimap2_preset,
+        threads=threads,
+        sort_memory=sort_memory,
+        keep_intermediates=keep_intermediates,
+        removable_intermediates=[reads_fastq],
+    )
+    result.update(
+        {
+            "input_type": "bam",
+            "input_primary_reads": bam_stats["primary_reads"],
+            "input_mapped_primary_reads": bam_stats["mapped_primary_reads"],
+        }
+    )
+    return result
+
+
+def run_fastq_pipeline(
+    fastq_path,
+    reference_path,
+    out_dir,
+    minimap2_preset="map-ont",
+    threads=1,
+    sort_memory="768M",
+    keep_intermediates=False,
+):
+    fastq_stats = inspect_fastq_input(fastq_path)
+    result = align_fastq_to_reference(
+        Path(fastq_path),
+        reference_path,
+        out_dir,
+        minimap2_preset=minimap2_preset,
+        threads=threads,
+        sort_memory=sort_memory,
+        keep_intermediates=keep_intermediates,
+    )
+    result.update(
+        {
+            "input_type": "fastq",
+            "input_primary_reads": fastq_stats["primary_reads"],
+            "input_total_bases": fastq_stats["total_bases"],
+            "input_mapped_primary_reads": 0,
+        }
+    )
+    return result
 
 
 def main():

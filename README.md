@@ -77,9 +77,10 @@ Each barcode must have:
 - `barcodeXX.final.fasta`
 - `barcodeXX.annotations.gbk`
 - `barcodeXX.final.fastq`
-- one raw/unmapped `.bam` file whose filename contains the barcode, such as
-  `FBD...barcode01...bam`, or one raw/unmapped `.bam` file inside a barcode
-  folder such as `barcode02\FBD...bam`.
+- one raw reads FASTQ/FASTQ.GZ file whose filename contains the barcode, such
+  as `barcode01.fastq.gz`. The raw FASTQ must be at least 100 KB and contain at
+  least 100 reads. Use `--use-bam` only when you intentionally want to run from
+  a raw/unmapped `.bam` file instead.
 
 Optional files:
 
@@ -87,6 +88,12 @@ Optional files:
 
 If a FASTQ is missing, the run still completes and the AB1 is generated from the
 FASTA with default quality scores, but the sample is reported with a warning.
+This `barcodeXX.final.fastq` file is the consensus FASTQ used for AB1 quality;
+it is not preferred as the raw read input for alignment metrics when a larger
+barcoded FASTQ is present. If multiple FASTQ files match a barcode, the script
+uses the largest file and reports a warning listing the ignored files.
+If no matching FASTQ looks like a real raw-read file, the run stops rather than
+silently falling back to BAM.
 
 The metadata sheet must contain the same barcode numbers as the data files. For
 example, a row with `Barcode #` equal to `1` matches `barcode01`.
@@ -169,6 +176,7 @@ python3 epi2me_to_final_package.py \
 - `--barcodes 1 2` limits the run to barcode01 and barcode02. Omit this option to process every barcode found.
 - `--multimer-denominator classified-reads` reports monomer/dimer/trimer/tetramer percentages only among reads that were close enough to 1x/2x/3x/4x plasmid length to classify. This is the default.
 - `--multimer-denominator all-eligible-reads` includes eligible mapped reads that were not classifiable and adds an `Unclassified` column to the multimer table.
+- `--use-bam` uses BAM files for alignment, host DNA, read-length distribution, and multimer metrics even when a raw FASTQ/FASTQ.GZ file is detected.
 - `--threads 4` makes alignment faster.
 - `--sort-memory 1G` gives `samtools sort` more memory.
 
@@ -192,6 +200,8 @@ The reported Host DNA % is the percentage of primary reads that pass that host
 classification rule. Base-weighted host percentages are also written to
 `report_summary.json` for review, but they are not used as the headline PDF
 value because a few very long host reads can otherwise dominate the number.
+By default, the raw reads come from the largest appropriately sized barcoded
+FASTQ/FASTQ.GZ. Pass `--use-bam` to force BAM input.
 
 It is okay to reuse the same `--output-dir`. If the same barcode is run again,
 the script removes the previous files for that barcode and writes fresh ones.
