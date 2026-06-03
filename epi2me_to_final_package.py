@@ -371,6 +371,9 @@ def load_metadata_lookup(path: Path) -> dict[str, dict[str, str]]:
     barcode_to_order: dict[str, str] = {}
     for row_number, row in enumerate(read_table_rows(metadata_path), start=1):
         meta = canonicalize_metadata_row(row)
+        if meta.get("sample_name"):
+            meta["worksheet_sample_name"] = meta["sample_name"]
+        meta["metadata_row_number"] = str(row_number)
         wps_sample_name = build_wps_sample_name(meta, row_number)
         if wps_sample_name:
             meta["sample_name"] = wps_sample_name
@@ -413,6 +416,43 @@ def group_packaged_by_order(packaged: list[dict[str, object]]) -> dict[str, dict
         order["samples"].append(item["sample_name"])
         order["reports"].append(item["pdf"])
     return grouped
+
+
+def metadata_row_sort_value(metadata: dict[str, str]) -> int:
+    try:
+        return int(metadata.get("metadata_row_number", ""))
+    except ValueError:
+        return 10**9
+
+
+def apply_order_local_sample_names(candidates: list[dict[str, object]]) -> None:
+    by_order: dict[str, list[dict[str, object]]] = defaultdict(list)
+    for candidate in candidates:
+        metadata = candidate.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        by_order[str(metadata.get("order_number", ""))].append(candidate)
+
+    for order_candidates in by_order.values():
+        sorted_candidates = sorted(
+            order_candidates,
+            key=lambda candidate: (
+                metadata_row_sort_value(candidate["metadata"]),
+                str(candidate.get("barcode", "")),
+                str(candidate.get("record_id", "")),
+            ),
+        )
+        for order_index, candidate in enumerate(sorted_candidates, start=1):
+            metadata = dict(candidate["metadata"])
+            raw_sample_name = metadata.get("worksheet_sample_name") or metadata.get("sample_name")
+            if raw_sample_name:
+                naming_meta = dict(metadata)
+                naming_meta["sample_name"] = raw_sample_name
+                local_sample_name = build_wps_sample_name(naming_meta, order_index)
+                if local_sample_name:
+                    metadata["sample_name"] = local_sample_name
+                    metadata["order_sample_number"] = str(order_index)
+            candidate["metadata"] = metadata
 
 
 def contig_label_from_filename(path: Path) -> str | None:
@@ -986,31 +1026,21 @@ def discover_input_records(
     return collapse_mixed_contigs_to_primary(expand_shared_barcode_files(dict(records))), discovery_errors
 
 
-def sample_stem_for_barcode(barcode: str, metadata: dict[str, str]) -> str:
-    return slugify(metadata.get("sample_name") or barcode)
-
-
-def find_sample_stem_collisions(
-    records: dict[str, dict[str, object]],
-    metadata_lookup: dict[str, dict[str, str]],
-    requested: set[str] | None,
-    invalid_record_ids: set[str],
-) -> dict[str, str]:
+def find_candidate_sample_stem_collisions(candidates: list[dict[str, object]]) -> dict[str, str]:
     stems: dict[str, list[str]] = defaultdict(list)
-    for record_id, record in records.items():
-        barcode = record.get("barcode")
-        if not isinstance(barcode, str):
+    for candidate in candidates:
+        record = candidate.get("record")
+        metadata = candidate.get("metadata")
+        barcode = candidate.get("barcode")
+        record_id = candidate.get("record_id")
+        if not isinstance(record, dict) or not isinstance(metadata, dict):
             continue
-        if requested is not None and barcode not in requested:
-            continue
-        if record_id in invalid_record_ids:
-            continue
-        if metadata_lookup and barcode not in metadata_lookup:
+        if not isinstance(barcode, str) or not isinstance(record_id, str):
             continue
         contig_label = record.get("contig_label")
         stem = sample_stem_for_record(
             barcode,
-            metadata_lookup.get(barcode, {}),
+            metadata,
             contig_label if isinstance(contig_label, str) else None,
         )
         stems[stem].append(record_id)
@@ -1186,7 +1216,7 @@ def plot_pdf_coverage_map(per_base_csv: Path, low_conf_csv: Path, out_path: Path
     if positions:
         ax.plot(positions, depths, color="#4f9da6", linewidth=1.3)
         if low_positions:
-            ax.scatter(low_positions, low_depths, marker="x", color="#e67e22", s=16, linewidths=0.8)
+            ax.scatter(low_positions, low_depths, marker="x", color="#e67e22", s=28, linewidths=1.1)
         ax.set_xlim(left=0, right=max(positions))
         ax.set_ylim(bottom=0, top=y_axis_top_with_headroom(max(depths, default=0)))
     else:
@@ -2175,13 +2205,6 @@ def main() -> None:
             if isinstance(records[record_id].get("barcode"), str) and records[record_id]["barcode"] in requested
         }
 
-    sample_stem_collisions = find_sample_stem_collisions(records, metadata_lookup, requested, invalid_record_ids)
-    for record_id, reason in sorted(sample_stem_collisions.items()):
-        record = records.get(record_id, {})
-        barcode = record.get("barcode", record_id)
-        skipped.append({"barcode": str(barcode), "record_id": record_id, "reason": reason})
-    invalid_record_ids.update(sample_stem_collisions)
-
     record_barcodes = {record["barcode"] for record in records.values() if isinstance(record.get("barcode"), str)}
     for record_id in sorted(considered_record_ids):
         record = records[record_id]
@@ -2198,6 +2221,7 @@ def main() -> None:
             continue
         skipped.append({"barcode": barcode, "reason": "metadata row has no matching EPI2ME files"})
 
+    packaging_candidates = []
     for record_id in sorted(records):
         record = records[record_id]
         barcode = record.get("barcode")
@@ -2221,6 +2245,26 @@ def main() -> None:
             skipped.append({"barcode": barcode, "record_id": record_id, "reason": f"missing required files: {', '.join(missing)}"})
             continue
         metadata = metadata_lookup.get(barcode, {})
+        packaging_candidates.append(
+            {
+                "record_id": record_id,
+                "record": record,
+                "barcode": barcode,
+                "metadata": metadata,
+            }
+        )
+
+    apply_order_local_sample_names(packaging_candidates)
+    sample_stem_collisions = find_candidate_sample_stem_collisions(packaging_candidates)
+
+    for candidate in packaging_candidates:
+        record_id = candidate["record_id"]
+        record = candidate["record"]
+        barcode = candidate["barcode"]
+        metadata = candidate["metadata"]
+        if record_id in sample_stem_collisions:
+            skipped.append({"barcode": barcode, "record_id": record_id, "reason": sample_stem_collisions[record_id]})
+            continue
         try:
             packaged.append(
                 package_sample(

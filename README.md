@@ -5,7 +5,9 @@ WPS order folders with one PDF report per sample.
 
 If several samples have the same `Order #` in the metadata sheet, their reports
 go into the same `WPS Data_Order #...` folder. Samples with different order
-numbers go into separate folders.
+numbers go into separate folders. Within each order folder, output filenames are
+renumbered from `001`, `002`, `003`, etc. based on that order's samples rather
+than the original barcode or worksheet row number.
 
 The main instructions below are for Windows using Ubuntu/WSL. Run the commands
 in the Ubuntu terminal, not in PowerShell, Command Prompt, or Anaconda Prompt.

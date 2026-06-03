@@ -594,7 +594,7 @@ def plot_coverage_map(per_base_rows, low_conf_rows, out_path, title):
     fig, ax = plt.subplots(figsize=(11, 4.8))
     ax.plot(positions, depths, color="#2f6c9e", linewidth=1.1)
     if low_positions:
-        ax.scatter(low_positions, low_depths, marker="x", color="#e67e22", s=18, linewidths=0.8)
+        ax.scatter(low_positions, low_depths, marker="x", color="#e67e22", s=30, linewidths=1.1)
     ax.set_xlim(left=0, right=max(positions))
     ax.set_ylim(bottom=0, top=y_axis_top_with_headroom(max(depths, default=0)))
     ax.margins(x=0)
