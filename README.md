@@ -190,7 +190,10 @@ Multimer classification uses a 15% length tolerance around each plasmid
 multiple. For example, a 5,000 bp contig treats reads near 5,000 bp as monomer
 and reads near 10,000 bp as dimer. The PDF table labels stay simple
 (`Monomer`, `Dimer`, etc.), but the displayed percentages are base-weighted so
-they match the read-length distribution graph's `Total Bases (kb)` view.
+they match the read-length distribution graph's `Total Bases (kb)` view. The
+same primary mapped reads shown as mapped in the read-length graph are eligible
+for multimer classification by full read length; there is no separate MAPQ or
+aligned-fraction cutoff.
 
 The report also checks the read-length distribution for evidence that the sample
 is not a single contig. If a sizeable base-weighted read-length peak is not near

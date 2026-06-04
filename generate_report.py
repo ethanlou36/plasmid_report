@@ -38,8 +38,11 @@ import pysam
 from bam_to_per_base_data import summarize_bam_to_table
 
 MULTIMER_TOLERANCE_FRACTION = 0.15
-MIN_MULTIMER_ALIGNMENT_FRACTION = 0.50
-MIN_MULTIMER_MAPQ = 1
+MIN_MULTIMER_ALIGNMENT_FRACTION = 0.0
+MIN_MULTIMER_MAPQ = 0
+MULTIMER_ELIGIBILITY_RULE = (
+    "primary mapped reads classified by full read length; no MAPQ or aligned-fraction cutoff"
+)
 READ_LENGTH_DISTRIBUTION_MIN_DISPLAY_BP = 1000
 PLOT_Y_AXIS_HEADROOM_FRACTION = 0.10
 NON_MULTIMER_PEAK_MIN_BASE_FRACTION = 0.08
@@ -453,18 +456,8 @@ def multimer_breakdown(
     }
 
 
-def alignment_fraction(read):
-    if not read.query_length:
-        return 0.0
-    return (read.query_alignment_length or 0) / read.query_length
-
-
 def is_multimer_eligible_alignment(read):
-    return (
-        not read.is_unmapped
-        and read.mapping_quality >= MIN_MULTIMER_MAPQ
-        and alignment_fraction(read) >= MIN_MULTIMER_ALIGNMENT_FRACTION
-    )
+    return not read.is_unmapped
 
 
 def selected_multimer_percentages(
@@ -562,6 +555,7 @@ def bam_summary(bam_path, contig_length, multimer_denominator=DEFAULT_MULTIMER_D
         "unclassified_multimer_base_count": multimer["unclassified_base_count"],
         "multimer_min_alignment_fraction": MIN_MULTIMER_ALIGNMENT_FRACTION,
         "multimer_min_mapq": MIN_MULTIMER_MAPQ,
+        "multimer_eligibility_rule": MULTIMER_ELIGIBILITY_RULE,
         "read_length_contig_detection": read_length_contig_detection,
         "primary_read_lengths": primary_read_lengths,
     }
@@ -790,6 +784,7 @@ def generate_report_data(
             "unclassified_multimer_base_count": bam_stats["unclassified_multimer_base_count"],
             "multimer_min_alignment_fraction": bam_stats["multimer_min_alignment_fraction"],
             "multimer_min_mapq": bam_stats["multimer_min_mapq"],
+            "multimer_eligibility_rule": bam_stats["multimer_eligibility_rule"],
             "read_length_contig_detection": bam_stats["read_length_contig_detection"],
             "single_contig": count_fasta_records(contig_fasta) == 1
             and bam_stats["read_length_contig_detection"]["single_contig_by_read_lengths"],

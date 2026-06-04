@@ -1294,8 +1294,8 @@ def plot_read_length_vs_bases(
         band_left = contig_length * (1.0 - MULTIMER_TOLERANCE_FRACTION)
         band_right = contig_length * (1.0 + MULTIMER_TOLERANCE_FRACTION)
         ymax = max((mapped_bases_kb + other_bases_kb).max(), 1)
-        ytop = y_axis_top_with_headroom(ymax)
-        label_y = ymax + (ytop - ymax) * 0.5
+        ytop = y_axis_top_with_headroom(ymax, headroom_fraction=0.16)
+        label_y = ymax + (ytop - ymax) * 0.68
         ax.axvspan(band_left, band_right, color="#d9d9d9", alpha=0.6, lw=0)
         ax.text(
             (band_left + band_right) / 2,
