@@ -226,6 +226,75 @@ same folder will not treat generated alignment files as new input BAMs.
 Most runs should not use `--keep-intermediates` or `--allow-aligned-input`.
 Those are debugging/override options.
 
+## 6. Report Calculation Details
+
+The PDF report is generated from the primary contig FASTA, the matching GenBank
+file, and the raw reads for the same barcode. By default, raw reads come from
+the largest appropriately sized barcoded FASTQ/FASTQ.GZ input set. Split raw
+FASTQs with the same base name and a trailing `-number` or `_number` are
+aggregated as one input. A raw FASTQ input set must pass the sanity check of at
+least 100 FASTQ records and at least 100,000 read bases. Passing `--use-bam`
+forces the workflow to use the raw/unmapped BAM instead.
+
+Plasmid alignment uses `minimap2 -ax map-ont` against the reported primary
+contig FASTA, then `samtools` converts, sorts, and indexes the alignment BAM.
+The read-length graph uses the same raw read lengths used for alignment. Reads
+`<= 1,000 bp` are omitted from the displayed read-length graph. The graph is
+base-weighted, so each bin shows `Total Bases (kb)` rather than read count.
+Mapped and unmapped bars are separated by whether the primary read mapped to the
+plasmid alignment BAM.
+
+Per-base depth and coverage are calculated from primary, non-supplementary
+alignments. Depth includes deletion-supporting reads. The low-confidence base
+threshold is Q12. Coverage plots start at 0 on the y-axis. Coverage plots use
+10% headroom above the highest value; the read-length graph uses 16% headroom so
+the `Monomer` band label sits above the tallest bar.
+
+Multimer classification is based on full raw read length for primary mapped
+reads, matching the mapped-read population shown in the read-length graph. There
+is no separate MAPQ or aligned-fraction cutoff. A read is classified by:
+
+```text
+read_length / contig_length
+```
+
+The tolerance is 15% around each plasmid multiple:
+
+- Monomer: within 15% of 1x contig length
+- Dimer: within 15% of 2x contig length
+- Trimer: within 15% of 3x contig length
+- Tetramer: within 15% of 4x contig length
+
+The PDF multimer table displays base-weighted percentages. In the default
+`classified-reads` mode, percentages are calculated only over reads that fall
+inside one of the 1x-4x windows. With `--multimer-denominator all-eligible-reads`,
+eligible mapped reads outside those windows remain in the denominator and appear
+as a base-weighted `Unclassified` column.
+
+The `Single Contig?` field checks both FASTA record count and the read-length
+distribution. A non-multimer peak is considered significant when it has at least
+3 reads and at least 8% of displayed read bases, and when the peak is not near a
+1x-4x plasmid multiple. Significant non-contig peak reads are excluded from the
+multimer calculation so a contaminant-sized read population does not distort the
+monomer/dimer/trimer/tetramer percentages.
+
+Host DNA % is calculated by aligning the same raw reads to the bundled
+`E. Coli Genome.fna` reference. A primary read counts as host when its E. coli
+alignment covers more than 1,300 bp and more than 91% of the read length. The
+headline PDF value is read-count based:
+
+```text
+host-classified primary reads / total primary reads * 100
+```
+
+Base-weighted host audit values are also written to `report_summary.json`, but
+they are not used as the headline PDF value.
+
+The generated `report_summary.json` and `package_summary.json` files keep audit
+fields for these calculations, including host counts, host base totals, multimer
+eligible/classified/unclassified counts, multimer thresholds, selected input
+paths, and any warnings such as mixed-contig or split-FASTQ handling.
+
 ## Troubleshooting
 
 If a barcode is skipped, check `run_summary.json`.
