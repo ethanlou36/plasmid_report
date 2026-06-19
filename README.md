@@ -176,6 +176,14 @@ python3 epi2me_to_final_package.py \
   --sort-memory 1G
 ```
 
+To add circular-projected diagnostic coverage outputs, use two hyphens:
+
+```bash
+python3 epi2me_to_final_package.py \
+  --folder-name "Run_2026_04_29" \
+  --circ true
+```
+
 - `--folder-name` names the folder under `/mnt/c/WPS data/` containing all run input files.
 - `--output-dir` is where the finished customer package will be written. If
   omitted, the output goes into `C:\WPS data\<folder-name>\output\`.
