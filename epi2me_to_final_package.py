@@ -45,6 +45,7 @@ import numpy as np
 import pysam
 
 from align_bam_pipeline import run_fastq_pipeline, run_pipeline
+from bam_to_per_base_data import summarize_circular_projected_bam_to_table
 from fastq_to_ab1 import phred_from_ascii, synthesize_chromatogram, write_real_ab1
 from generate_report import (
     DEFAULT_MULTIMER_DENOMINATOR,
@@ -52,9 +53,12 @@ from generate_report import (
     MULTIMER_DENOMINATOR_CHOICES,
     MULTIMER_TOLERANCE_FRACTION,
     READ_LENGTH_DISTRIBUTION_MIN_DISPLAY_BP,
+    coverage_summary,
     count_fasta_records,
     generate_report_data,
+    plot_coverage_map,
     read_first_fasta_record,
+    read_per_base_rows,
     y_axis_top_with_headroom,
 )
 
@@ -194,6 +198,17 @@ def parse_expected_size_bp(value: str | int | float | None) -> int | None:
     if unit in {"kb", "kilobase", "kilobases", "k"}:
         number *= 1000
     return int(round(number))
+
+
+def parse_bool_arg(value: str | bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"expected true or false, got {value!r}")
 
 
 def lengths_match(observed_bp: int, expected_bp: int) -> bool:
@@ -1232,6 +1247,120 @@ def plot_pdf_coverage_map(per_base_csv: Path, low_conf_csv: Path, out_path: Path
     return out_path
 
 
+def write_doubled_reference_fasta(src_fasta: Path, dst_fasta: Path) -> dict[str, object]:
+    record = read_first_fasta_record(src_fasta)
+    sequence = record["sequence"]
+    if not sequence:
+        raise ValueError(f"cannot build circular reference from empty FASTA: {src_fasta}")
+    doubled_name = f"{record['name']}__circular_doubled"
+    dst_fasta.parent.mkdir(parents=True, exist_ok=True)
+    with dst_fasta.open("w", encoding="ascii") as handle:
+        handle.write(f">{doubled_name}\n")
+        doubled_sequence = sequence + sequence
+        for index in range(0, len(doubled_sequence), 80):
+            handle.write(f"{doubled_sequence[index:index + 80]}\n")
+    return {
+        "original_name": record["name"],
+        "doubled_name": doubled_name,
+        "original_length_bp": record["length_bp"],
+        "doubled_length_bp": record["length_bp"] * 2,
+        "doubled_fasta": str(dst_fasta),
+    }
+
+
+def write_report_summary_json(report_summary: dict) -> None:
+    summary_json = report_summary.get("outputs", {}).get("report_summary_json")
+    if not summary_json:
+        return
+    Path(summary_json).write_text(json.dumps(report_summary, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def generate_circular_coverage_diagnostic(
+    raw_reads_path,
+    raw_reads_format: str,
+    original_fasta: Path,
+    work_dir: Path,
+    report_dir: Path,
+    threads: int,
+    sort_memory: str,
+    keep_intermediates: bool,
+    allow_aligned_input: bool,
+) -> dict[str, object]:
+    circular_dir = work_dir / "circular_coverage"
+    alignment_dir = circular_dir / "alignment"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    doubled_fasta = circular_dir / "doubled_reference.fa"
+    doubled_reference = write_doubled_reference_fasta(original_fasta, doubled_fasta)
+
+    if raw_reads_format == "fastq":
+        circular_alignment_result = run_fastq_pipeline(
+            raw_reads_path,
+            doubled_fasta,
+            alignment_dir,
+            minimap2_preset="map-ont",
+            threads=threads,
+            sort_memory=sort_memory,
+            keep_intermediates=keep_intermediates,
+        )
+    elif raw_reads_format == "bam":
+        circular_alignment_result = run_pipeline(
+            raw_reads_path,
+            doubled_fasta,
+            alignment_dir,
+            minimap2_preset="map-ont",
+            threads=threads,
+            sort_memory=sort_memory,
+            keep_intermediates=keep_intermediates,
+            allow_aligned_input=allow_aligned_input,
+        )
+    else:
+        raise ValueError(f"unsupported circular coverage input format: {raw_reads_format}")
+
+    circular_per_base_csv = report_dir / "circular_projected_per_base_details.csv"
+    circular_low_conf_csv = report_dir / "circular_projected_low_confidence_bases.csv"
+    summarize_circular_projected_bam_to_table(
+        bam_path=circular_alignment_result["sorted_bam"],
+        output_csv=circular_per_base_csv,
+        reference_path=original_fasta,
+        contig=doubled_reference["doubled_name"],
+        low_confidence_out=circular_low_conf_csv,
+        low_confidence_qscore=LOW_CONFIDENCE_QSCORE,
+    )
+
+    per_base_rows = read_per_base_rows(circular_per_base_csv)
+    low_conf_rows = read_per_base_rows(circular_low_conf_csv)
+    circular_coverage_stats = coverage_summary(
+        per_base_rows,
+        low_conf_rows,
+        int(doubled_reference["original_length_bp"]),
+    )
+
+    circular_coverage_png = report_dir / "circular_projected_coverage_map.png"
+    circular_pdf_coverage_png = work_dir / "circular_projected_coverage_map_pdf.png"
+    plot_coverage_map(
+        per_base_rows,
+        low_conf_rows,
+        circular_coverage_png,
+        title=f"{doubled_reference['original_name']} Circular-Projected Coverage Map",
+    )
+    plot_pdf_coverage_map(circular_per_base_csv, circular_low_conf_csv, circular_pdf_coverage_png)
+
+    return {
+        "enabled": True,
+        "method": "reads aligned to duplicated plasmid reference; positions projected with doubled_pos % original_length",
+        "reference": doubled_reference,
+        "alignment": circular_alignment_result,
+        "coverage": circular_coverage_stats,
+        "outputs": {
+            "per_base_details_csv": str(circular_per_base_csv),
+            "low_confidence_bases_csv": str(circular_low_conf_csv),
+            "coverage_map_png": str(circular_coverage_png),
+            "pdf_style_coverage_map_png": str(circular_pdf_coverage_png),
+            "aligned_bam": circular_alignment_result["sorted_bam"],
+        },
+    }
+
+
 def plot_read_length_vs_bases(
     raw_reads_path: Path | list[Path],
     aligned_bam: Path,
@@ -1851,6 +1980,7 @@ def package_sample(
     allow_aligned_input: bool = False,
     use_bam: bool = False,
     multimer_denominator: str = DEFAULT_MULTIMER_DENOMINATOR,
+    circular_coverage: bool = False,
 ) -> dict[str, object]:
     barcode = record.get("barcode")
     if not isinstance(barcode, str):
@@ -2000,6 +2130,37 @@ def package_sample(
     )
     warnings.extend(validate_length_consistency(metadata, renamed["length_bp"], report_summary))
 
+    circular_diagnostic = None
+    if circular_coverage:
+        circular_diagnostic = generate_circular_coverage_diagnostic(
+            raw_reads_path=raw_reads_path,
+            raw_reads_format=raw_reads_format,
+            original_fasta=fasta_out,
+            work_dir=work_dir,
+            report_dir=report_dir,
+            threads=threads,
+            sort_memory=sort_memory,
+            keep_intermediates=keep_intermediates,
+            allow_aligned_input=allow_aligned_input,
+        )
+        report_summary["circular_coverage_diagnostic"] = circular_diagnostic
+        report_summary["outputs"].update(
+            {
+                "circular_projected_per_base_details_csv": circular_diagnostic["outputs"]["per_base_details_csv"],
+                "circular_projected_low_confidence_bases_csv": circular_diagnostic["outputs"][
+                    "low_confidence_bases_csv"
+                ],
+                "circular_projected_coverage_map_png": circular_diagnostic["outputs"]["coverage_map_png"],
+                "circular_projected_pdf_style_coverage_map_png": circular_diagnostic["outputs"][
+                    "pdf_style_coverage_map_png"
+                ],
+            }
+        )
+        write_report_summary_json(report_summary)
+        warnings.append(
+            "circular coverage diagnostic enabled; customer package keeps linear coverage files by default"
+        )
+
     per_base_src = Path(report_summary["outputs"]["per_base_details_csv"])
     low_conf_src = Path(report_summary["outputs"]["low_confidence_bases_csv"])
     coverage_png = plot_pdf_coverage_map(per_base_src, low_conf_src, work_dir / "coverage_map_pdf.png")
@@ -2047,6 +2208,7 @@ def package_sample(
                 "order_number": order_number,
                 "multimer_denominator": multimer_denominator,
                 "warnings": warnings,
+                "circular_coverage_diagnostic": circular_diagnostic,
                 "paths": {
                     "order_dir": str(order_dir),
                     "pdf": str(pdf_out),
@@ -2158,6 +2320,27 @@ def parse_args() -> argparse.Namespace:
             "classified-reads reports percentages only among reads classified as 1x-4x; "
             "all-eligible-reads includes unclassified eligible mapped reads in the denominator. "
             "PDF table percentages are base-weighted."
+        ),
+    )
+    parser.add_argument(
+        "--circular-coverage",
+        action="store_true",
+        dest="circ",
+        help=(
+            "Optional diagnostic: align reads to a duplicated plasmid reference, project coverage back to "
+            "the original coordinates, and write circular_projected_* files in the work/report summary. "
+            "Customer-facing coverage files remain the normal linear alignment outputs."
+        ),
+    )
+    parser.add_argument(
+        "--circ",
+        nargs="?",
+        const=True,
+        default=False,
+        type=parse_bool_arg,
+        help=(
+            "Short on/off form for circular coverage diagnostics. Use --circ true to enable or "
+            "--circ false to force the original linear-only pipeline."
         ),
     )
     return parser.parse_args()
@@ -2279,6 +2462,7 @@ def main() -> None:
                     allow_aligned_input=args.allow_aligned_input,
                     use_bam=args.use_bam,
                     multimer_denominator=args.multimer_denominator,
+                    circular_coverage=args.circ,
                 )
             )
         except subprocess.CalledProcessError as exc:
@@ -2294,6 +2478,7 @@ def main() -> None:
         "input_dir": str(input_dir),
         "metadata": str(metadata_path) if metadata_path else None,
         "multimer_denominator": args.multimer_denominator,
+        "circular_coverage": args.circ,
         "output_dir": str(output_dir),
         "packaged": packaged,
         "orders": grouped_orders,

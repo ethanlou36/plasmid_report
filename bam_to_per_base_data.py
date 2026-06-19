@@ -21,6 +21,22 @@ from pathlib import Path
 
 import pysam
 
+PER_BASE_FIELDNAMES = [
+    "pos",
+    "base",
+    "depth",
+    "match_count",
+    "vaf",
+    "G",
+    "A",
+    "T",
+    "C",
+    "ins",
+    "del",
+    "qscore",
+    "confidence",
+]
+
 
 def open_maybe_gzip(path):
     path = str(path)
@@ -256,6 +272,127 @@ def build_row(
     }
 
 
+def empty_projected_position():
+    return {
+        "base_counts": {base: 0 for base in "GATC"},
+        "base_qualities": {base: [] for base in "GATC"},
+        "depth": 0,
+        "ins_count": 0,
+        "del_count": 0,
+        "ambiguous_count": 0,
+        "refskip_count": 0,
+        "filtered_low_quality_count": 0,
+    }
+
+
+def projected_position_to_row(
+    reference_pos,
+    position,
+    reference_base=None,
+    low_confidence_qscore=12,
+):
+    base_counts = position["base_counts"]
+    consensus_base = choose_consensus_base(base_counts, reference_base=reference_base)
+    match_count = base_counts.get(consensus_base, 0)
+    depth = position["depth"]
+    vaf = (match_count / depth) if depth else 0.0
+    qscore = compute_qscore(position["base_qualities"].get(consensus_base, []))
+    confidence = confidence_label(
+        depth=depth,
+        qscore=qscore,
+        low_confidence_qscore=low_confidence_qscore,
+        ambiguous_count=position["ambiguous_count"],
+        refskip_count=position["refskip_count"],
+        filtered_low_quality_count=position["filtered_low_quality_count"],
+    )
+    return {
+        "pos": reference_pos + 1,
+        "base": consensus_base,
+        "depth": depth,
+        "match_count": match_count,
+        "vaf": f"{vaf:.6f}",
+        "G": base_counts["G"],
+        "A": base_counts["A"],
+        "T": base_counts["T"],
+        "C": base_counts["C"],
+        "ins": position["ins_count"],
+        "del": position["del_count"],
+        "qscore": qscore,
+        "confidence": confidence,
+    }
+
+
+def iter_circular_projected_rows(
+    bam,
+    contig,
+    reference_seq,
+    min_base_quality=0,
+    low_confidence_qscore=12,
+):
+    reference_length = len(reference_seq)
+    if reference_length <= 0:
+        raise ValueError("reference sequence must be non-empty")
+
+    positions = [empty_projected_position() for _ in range(reference_length)]
+
+    for read in bam.fetch(contig):
+        if read.is_unmapped or read.is_secondary or read.is_supplementary:
+            continue
+
+        query_sequence = read.query_sequence
+        if not query_sequence:
+            continue
+        query_qualities = read.query_qualities
+        last_projected_pos = None
+        in_insertion = False
+
+        for query_pos, ref_pos, cigar_op in read.get_aligned_pairs(matches_only=False, with_cigar=True):
+            if ref_pos is None:
+                if query_pos is not None and cigar_op == pysam.CINS and last_projected_pos is not None:
+                    if not in_insertion:
+                        positions[last_projected_pos]["ins_count"] += 1
+                    in_insertion = True
+                continue
+
+            projected_pos = ref_pos % reference_length
+            last_projected_pos = projected_pos
+            in_insertion = False
+            position = positions[projected_pos]
+
+            if cigar_op == pysam.CREF_SKIP:
+                position["refskip_count"] += 1
+                continue
+
+            if query_pos is None:
+                position["del_count"] += 1
+                position["depth"] += 1
+                continue
+
+            if query_pos >= len(query_sequence):
+                continue
+
+            quality = int(query_qualities[query_pos]) if query_qualities is not None else 0
+            if quality < min_base_quality:
+                position["filtered_low_quality_count"] += 1
+                continue
+
+            position["depth"] += 1
+            query_base = query_sequence[query_pos].upper()
+            if query_base in position["base_counts"]:
+                position["base_counts"][query_base] += 1
+                position["base_qualities"][query_base].append(quality)
+            else:
+                position["ambiguous_count"] += 1
+
+    for reference_pos, position in enumerate(positions):
+        yield projected_position_to_row(
+            reference_pos=reference_pos,
+            position=position,
+            reference_base=reference_seq[reference_pos],
+            low_confidence_qscore=low_confidence_qscore,
+        )
+
+
 def iter_rows(
     bam,
     contig,
@@ -360,32 +497,16 @@ def summarize_bam_to_table(
         if end is not None and end <= start:
             raise ValueError("end must be greater than start")
 
-        fieldnames = [
-            "pos",
-            "base",
-            "depth",
-            "match_count",
-            "vaf",
-            "G",
-            "A",
-            "T",
-            "C",
-            "ins",
-            "del",
-            "qscore",
-            "confidence",
-        ]
-
         low_writer = None
         low_handle = None
         if low_confidence_out is not None:
             low_handle = open(low_confidence_out, "w", newline="", encoding="ascii")
-            low_writer = csv.DictWriter(low_handle, fieldnames=fieldnames)
+            low_writer = csv.DictWriter(low_handle, fieldnames=PER_BASE_FIELDNAMES)
             low_writer.writeheader()
 
         try:
             with open(output_csv, "w", newline="", encoding="ascii") as handle:
-                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer = csv.DictWriter(handle, fieldnames=PER_BASE_FIELDNAMES)
                 writer.writeheader()
                 for row in iter_rows(
                     bam=bam,
@@ -394,6 +515,53 @@ def summarize_bam_to_table(
                     end=end,
                     reference_seq=reference_seq,
                     include_zero_depth=include_zero_depth,
+                    min_base_quality=min_base_quality,
+                    low_confidence_qscore=low_confidence_qscore,
+                ):
+                    writer.writerow(row)
+                    if low_writer is not None and int(row["qscore"]) < low_confidence_qscore:
+                        low_writer.writerow(row)
+        finally:
+            if low_handle is not None:
+                low_handle.close()
+
+
+def summarize_circular_projected_bam_to_table(
+    bam_path,
+    output_csv,
+    reference_path,
+    contig=None,
+    low_confidence_out=None,
+    low_confidence_qscore=12,
+    min_base_quality=0,
+):
+    reference_lookup = load_reference_sequences(reference_path)
+    if not reference_lookup:
+        raise ValueError(f"No reference sequences found in {reference_path}")
+    if len(reference_lookup) != 1:
+        raise ValueError("Circular projection currently requires a single-reference FASTA")
+    reference_seq = next(iter(reference_lookup.values()))
+
+    with pysam.AlignmentFile(bam_path, "rb") as bam:
+        if bam.nreferences == 0:
+            raise ValueError("BAM has no reference sequences (@SQ); align the reads first")
+        contig = resolve_contig(bam, contig)
+
+        low_writer = None
+        low_handle = None
+        if low_confidence_out is not None:
+            low_handle = open(low_confidence_out, "w", newline="", encoding="ascii")
+            low_writer = csv.DictWriter(low_handle, fieldnames=PER_BASE_FIELDNAMES)
+            low_writer.writeheader()
+
+        try:
+            with open(output_csv, "w", newline="", encoding="ascii") as handle:
+                writer = csv.DictWriter(handle, fieldnames=PER_BASE_FIELDNAMES)
+                writer.writeheader()
+                for row in iter_circular_projected_rows(
+                    bam=bam,
+                    contig=contig,
+                    reference_seq=reference_seq,
                     min_base_quality=min_base_quality,
                     low_confidence_qscore=low_confidence_qscore,
                 ):
@@ -439,20 +607,41 @@ def main():
         default=0,
         help="Minimum base quality threshold for pileup counting",
     )
+    parser.add_argument(
+        "--circular-project",
+        action="store_true",
+        help=(
+            "Interpret the aligned BAM as reads mapped to a doubled circular reference and "
+            "project per-base counts back onto --reference coordinates"
+        ),
+    )
     args = parser.parse_args()
 
-    summarize_bam_to_table(
-        bam_path=args.bam,
-        output_csv=args.out,
-        reference_path=args.reference,
-        contig=args.contig,
-        start=args.start,
-        end=args.end,
-        include_zero_depth=args.include_zero_depth,
-        low_confidence_out=args.low_confidence_out,
-        low_confidence_qscore=args.low_confidence_qscore,
-        min_base_quality=args.min_base_quality,
-    )
+    if args.circular_project:
+        if args.reference is None:
+            raise ValueError("--circular-project requires --reference")
+        summarize_circular_projected_bam_to_table(
+            bam_path=args.bam,
+            output_csv=args.out,
+            reference_path=args.reference,
+            contig=args.contig,
+            low_confidence_out=args.low_confidence_out,
+            low_confidence_qscore=args.low_confidence_qscore,
+            min_base_quality=args.min_base_quality,
+        )
+    else:
+        summarize_bam_to_table(
+            bam_path=args.bam,
+            output_csv=args.out,
+            reference_path=args.reference,
+            contig=args.contig,
+            start=args.start,
+            end=args.end,
+            include_zero_depth=args.include_zero_depth,
+            low_confidence_out=args.low_confidence_out,
+            low_confidence_qscore=args.low_confidence_qscore,
+            min_base_quality=args.min_base_quality,
+        )
 
 
 if __name__ == "__main__":
