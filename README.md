@@ -176,12 +176,21 @@ python3 epi2me_to_final_package.py \
   --sort-memory 1G
 ```
 
-To add circular-projected diagnostic coverage outputs, use two hyphens:
+Circular-projected diagnostic coverage outputs are enabled by default. To make
+that explicit, use two hyphens:
 
 ```bash
 python3 epi2me_to_final_package.py \
   --folder-name "Run_2026_04_29" \
   --circ true
+```
+
+To run the original linear-only pipeline without circular diagnostics:
+
+```bash
+python3 epi2me_to_final_package.py \
+  --folder-name "Run_2026_04_29" \
+  --circ false
 ```
 
 - `--folder-name` names the folder under `/mnt/c/WPS data/` containing all run input files.
@@ -191,7 +200,7 @@ python3 epi2me_to_final_package.py \
 - `--multimer-denominator classified-reads` reports monomer/dimer/trimer/tetramer percentages only among reads that were close enough to 1x/2x/3x/4x plasmid length to classify. This is the default.
 - `--multimer-denominator all-eligible-reads` includes eligible mapped reads that were not classifiable and adds a base-weighted `Unclassified` column to the multimer table.
 - `--use-bam` uses BAM files for alignment, host DNA, read-length distribution, and multimer metrics even when a raw FASTQ/FASTQ.GZ file is detected.
-- `--circ true` or `--circular-coverage` adds a diagnostic circular coverage run. Reads are aligned to a duplicated plasmid reference, projected back to the original coordinates, and written as `circular_projected_*` files under the work/report outputs. Omit it, or pass `--circ false`, to run the original linear-only pipeline.
+- `--circ true` is the default and adds a diagnostic circular coverage run. Reads are aligned to a duplicated plasmid reference, projected back to the original coordinates, and written as `circular_projected_*` files under the work/report outputs. Pass `--circ false` to run the original linear-only pipeline.
 - `--threads 4` makes alignment faster.
 - `--sort-memory 1G` gives `samtools sort` more memory.
 
@@ -259,7 +268,7 @@ threshold is Q12. Coverage plots start at 0 on the y-axis. Coverage plots use
 10% headroom above the highest value; the read-length graph uses 16% headroom so
 the `Monomer` band label sits above the tallest bar.
 
-When `--circ true` or `--circular-coverage` is enabled, the normal coverage files are left
+By default, the normal coverage files are left
 unchanged and an extra diagnostic is added to the work directory. It creates a
 doubled plasmid FASTA, aligns the same raw reads to that doubled reference, and
 projects every covered doubled-reference position back with modulo arithmetic.

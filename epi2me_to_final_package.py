@@ -1980,7 +1980,7 @@ def package_sample(
     allow_aligned_input: bool = False,
     use_bam: bool = False,
     multimer_denominator: str = DEFAULT_MULTIMER_DENOMINATOR,
-    circular_coverage: bool = False,
+    circular_coverage: bool = True,
 ) -> dict[str, object]:
     barcode = record.get("barcode")
     if not isinstance(barcode, str):
@@ -2326,8 +2326,10 @@ def parse_args() -> argparse.Namespace:
         "--circular-coverage",
         action="store_true",
         dest="circ",
+        default=argparse.SUPPRESS,
         help=(
-            "Optional diagnostic: align reads to a duplicated plasmid reference, project coverage back to "
+            "Enable circular coverage diagnostics. This is now the default; kept as an explicit alias for "
+            "--circ true. Align reads to a duplicated plasmid reference, project coverage back to "
             "the original coordinates, and write circular_projected_* files in the work/report summary. "
             "Customer-facing coverage files remain the normal linear alignment outputs."
         ),
@@ -2336,11 +2338,11 @@ def parse_args() -> argparse.Namespace:
         "--circ",
         nargs="?",
         const=True,
-        default=False,
+        default=True,
         type=parse_bool_arg,
         help=(
-            "Short on/off form for circular coverage diagnostics. Use --circ true to enable or "
-            "--circ false to force the original linear-only pipeline."
+            "Short on/off form for circular coverage diagnostics. Defaults to true; use --circ false "
+            "to force the original linear-only pipeline."
         ),
     )
     return parser.parse_args()
