@@ -53,6 +53,7 @@ from generate_report import (
     MULTIMER_DENOMINATOR_CHOICES,
     MULTIMER_TOLERANCE_FRACTION,
     READ_LENGTH_DISTRIBUTION_MIN_DISPLAY_BP,
+    bam_summary,
     coverage_summary,
     count_fasta_records,
     generate_report_data,
@@ -1361,6 +1362,113 @@ def generate_circular_coverage_diagnostic(
     }
 
 
+def apply_circular_report_basis(
+    report_summary: dict,
+    circular_diagnostic: dict[str, object],
+    contig_length: int,
+    multimer_denominator: str,
+) -> dict[str, object]:
+    linear_basis = {
+        "coverage": report_summary.get("coverage"),
+        "assembly_status": {
+            key: report_summary.get("assembly_status", {}).get(key)
+            for key in (
+                "reads_mapped",
+                "reads_mapped_pct",
+                "bases_mapped",
+                "bases_mapped_pct",
+                "coverage_x",
+                "median_coverage_x",
+            )
+        },
+        "outputs": {
+            key: report_summary.get("outputs", {}).get(key)
+            for key in ("per_base_details_csv", "low_confidence_bases_csv", "coverage_map_png")
+        },
+    }
+
+    circular_outputs = circular_diagnostic["outputs"]
+    circular_stats = bam_summary(
+        circular_outputs["aligned_bam"],
+        contig_length,
+        multimer_denominator=multimer_denominator,
+    )
+    circular_coverage = circular_diagnostic["coverage"]
+
+    sequencing = report_summary["sequencing_information"]
+    sequencing.update(
+        {
+            "total_dna_reads": circular_stats["primary_reads"],
+            "total_dna_bases": circular_stats["total_bases"],
+            "mean_read_length": circular_stats["mean_read_length"],
+            "median_read_length": circular_stats["median_read_length"],
+            "read_length_n50": circular_stats["read_length_n50"],
+        }
+    )
+
+    assembly = report_summary["assembly_status"]
+    assembly.update(
+        {
+            "alignment_method": "circular_projected",
+            "linear_alignment_basis": linear_basis,
+            "reads_mapped": circular_stats["mapped_primary_reads"],
+            "reads_mapped_pct": round(circular_stats["mapped_read_pct"], 3),
+            "bases_mapped": circular_stats["mapped_bases"],
+            "bases_mapped_pct": round(circular_stats["mapped_base_pct"], 3),
+            "coverage_x": round(circular_coverage["mean_depth"], 3),
+            "median_coverage_x": circular_coverage["median_depth"],
+            "monomer_pct": circular_stats["monomer_pct"],
+            "dimer_pct": circular_stats["dimer_pct"],
+            "trimer_pct": circular_stats["trimer_pct"],
+            "tetramer_pct": circular_stats["tetramer_pct"],
+            "multimer_by_moles_pct": circular_stats["multimer_by_moles_pct"],
+            "multimer_by_mass_pct": circular_stats["multimer_by_mass_pct"],
+            "multimer_by_all_eligible_reads_pct": circular_stats["multimer_by_all_eligible_reads_pct"],
+            "multimer_by_classified_reads_pct": circular_stats["multimer_by_classified_reads_pct"],
+            "multimer_calculated": circular_stats["multimer_calculated"],
+            "multimer_denominator": circular_stats["multimer_denominator"],
+            "multimer_eligible_read_count": circular_stats["multimer_eligible_read_count"],
+            "multimer_eligible_base_count": circular_stats["multimer_eligible_base_count"],
+            "multimer_excluded_non_contig_peak_read_count": circular_stats[
+                "multimer_excluded_non_contig_peak_read_count"
+            ],
+            "multimer_excluded_non_contig_peak_base_count": circular_stats[
+                "multimer_excluded_non_contig_peak_base_count"
+            ],
+            "unclassified_multimer_read_pct": circular_stats["unclassified_multimer_read_pct"],
+            "unclassified_multimer_base_pct": circular_stats["unclassified_multimer_base_pct"],
+            "classified_multimer_read_count": circular_stats["classified_multimer_read_count"],
+            "classified_multimer_base_count": circular_stats["classified_multimer_base_count"],
+            "unclassified_multimer_read_count": circular_stats["unclassified_multimer_read_count"],
+            "unclassified_multimer_base_count": circular_stats["unclassified_multimer_base_count"],
+            "multimer_min_alignment_fraction": circular_stats["multimer_min_alignment_fraction"],
+            "multimer_min_mapq": circular_stats["multimer_min_mapq"],
+            "multimer_eligibility_rule": circular_stats["multimer_eligibility_rule"],
+            "read_length_contig_detection": circular_stats["read_length_contig_detection"],
+            "single_contig": report_summary["contig"]["fasta_record_count"] == 1
+            and circular_stats["read_length_contig_detection"]["single_contig_by_read_lengths"],
+        }
+    )
+
+    report_summary["coverage"] = circular_coverage
+    report_summary["report_basis"] = "circular_projected"
+    report_summary["outputs"].update(
+        {
+            "linear_per_base_details_csv": linear_basis["outputs"]["per_base_details_csv"],
+            "linear_low_confidence_bases_csv": linear_basis["outputs"]["low_confidence_bases_csv"],
+            "linear_coverage_map_png": linear_basis["outputs"]["coverage_map_png"],
+            "per_base_details_csv": circular_outputs["per_base_details_csv"],
+            "low_confidence_bases_csv": circular_outputs["low_confidence_bases_csv"],
+            "coverage_map_png": circular_outputs["coverage_map_png"],
+            "circular_projected_per_base_details_csv": circular_outputs["per_base_details_csv"],
+            "circular_projected_low_confidence_bases_csv": circular_outputs["low_confidence_bases_csv"],
+            "circular_projected_coverage_map_png": circular_outputs["coverage_map_png"],
+            "circular_projected_pdf_style_coverage_map_png": circular_outputs["pdf_style_coverage_map_png"],
+        }
+    )
+    return linear_basis
+
+
 def plot_read_length_vs_bases(
     raw_reads_path: Path | list[Path],
     aligned_bam: Path,
@@ -2131,6 +2239,7 @@ def package_sample(
     warnings.extend(validate_length_consistency(metadata, renamed["length_bp"], report_summary))
 
     circular_diagnostic = None
+    report_aligned_bam = aligned_bam
     if circular_coverage:
         circular_diagnostic = generate_circular_coverage_diagnostic(
             raw_reads_path=raw_reads_path,
@@ -2144,26 +2253,24 @@ def package_sample(
             allow_aligned_input=allow_aligned_input,
         )
         report_summary["circular_coverage_diagnostic"] = circular_diagnostic
-        report_summary["outputs"].update(
-            {
-                "circular_projected_per_base_details_csv": circular_diagnostic["outputs"]["per_base_details_csv"],
-                "circular_projected_low_confidence_bases_csv": circular_diagnostic["outputs"][
-                    "low_confidence_bases_csv"
-                ],
-                "circular_projected_coverage_map_png": circular_diagnostic["outputs"]["coverage_map_png"],
-                "circular_projected_pdf_style_coverage_map_png": circular_diagnostic["outputs"][
-                    "pdf_style_coverage_map_png"
-                ],
-            }
+        apply_circular_report_basis(
+            report_summary,
+            circular_diagnostic,
+            renamed["length_bp"],
+            multimer_denominator,
         )
+        report_aligned_bam = Path(circular_diagnostic["outputs"]["aligned_bam"])
         write_report_summary_json(report_summary)
         warnings.append(
-            "circular coverage diagnostic enabled; customer package keeps linear coverage files by default"
+            "circular coverage enabled; PDF metrics, coverage map, and per-base package files use circular projection"
         )
 
     per_base_src = Path(report_summary["outputs"]["per_base_details_csv"])
     low_conf_src = Path(report_summary["outputs"]["low_confidence_bases_csv"])
-    coverage_png = plot_pdf_coverage_map(per_base_src, low_conf_src, work_dir / "coverage_map_pdf.png")
+    if circular_coverage and circular_diagnostic is not None:
+        coverage_png = Path(circular_diagnostic["outputs"]["pdf_style_coverage_map_png"])
+    else:
+        coverage_png = plot_pdf_coverage_map(per_base_src, low_conf_src, work_dir / "coverage_map_pdf.png")
     feature_map_value = report_summary["outputs"].get("feature_map_png")
     feature_map_png = find_existing_path([Path(feature_map_value)]) if feature_map_value else None
 
@@ -2176,7 +2283,7 @@ def package_sample(
 
     bases_plot = plot_read_length_vs_bases(
         raw_reads_path,
-        aligned_bam,
+        report_aligned_bam,
         renamed["length_bp"],
         work_dir / "read_length_vs_bases.png",
         raw_reads_format=raw_reads_format,
@@ -2220,6 +2327,7 @@ def package_sample(
                     "per_base_details": str(per_base_dst),
                     "low_confidence": str(low_conf_dst),
                     "aligned_bam": str(aligned_bam),
+                    "report_aligned_bam": str(report_aligned_bam),
                     "host_aligned_bam": host_aligned_bam,
                 },
             },
@@ -2328,10 +2436,9 @@ def parse_args() -> argparse.Namespace:
         dest="circ",
         default=argparse.SUPPRESS,
         help=(
-            "Enable circular coverage diagnostics. This is now the default; kept as an explicit alias for "
+            "Enable circular-projected report coverage. This is now the default; kept as an explicit alias for "
             "--circ true. Align reads to a duplicated plasmid reference, project coverage back to "
-            "the original coordinates, and write circular_projected_* files in the work/report summary. "
-            "Customer-facing coverage files remain the normal linear alignment outputs."
+            "the original coordinates, and use the projected coverage for report metrics and packaged per-base files."
         ),
     )
     parser.add_argument(
@@ -2341,7 +2448,7 @@ def parse_args() -> argparse.Namespace:
         default=True,
         type=parse_bool_arg,
         help=(
-            "Short on/off form for circular coverage diagnostics. Defaults to true; use --circ false "
+            "Short on/off form for circular-projected report coverage. Defaults to true; use --circ false "
             "to force the original linear-only pipeline."
         ),
     )
