@@ -320,6 +320,12 @@ fields for these calculations, including host counts, host base totals, multimer
 eligible/classified/unclassified counts, multimer thresholds, selected input
 paths, and any warnings such as mixed-contig or split-FASTQ handling.
 
+Each order's `QC REPORTS` folder also gets an order-level virtual gel PNG named
+`Order_<order>_virtual_gel.png`. The virtual gel uses the same selected raw read
+input as the report read-length graph, including split FASTQ aggregation and
+`--use-bam` behavior. Reads `<= 1,000 bp` are omitted, and lane intensity is
+base-weighted so darker bands represent more DNA mass at that read length.
+
 ## Troubleshooting
 
 If a barcode is skipped, check `run_summary.json`.

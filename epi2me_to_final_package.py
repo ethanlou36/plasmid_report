@@ -62,6 +62,7 @@ from generate_report import (
     read_per_base_rows,
     y_axis_top_with_headroom,
 )
+from virtual_gel import make_virtual_gel
 
 
 PACKAGE_SUBDIRS = {
@@ -96,6 +97,7 @@ THEME = {
     "teal": "#0D8686",
     "table_border": "#052866",
     "table_grid": "#052866",
+    "table_header_fill": "#F1F3F5",
     "purple": "#51459A",
     "green": "#44D8A4",
     "cyan": "#12A9D4",
@@ -112,6 +114,7 @@ INPUT_ROOT = Path("/mnt/c/WPS data")
 DEFAULT_OUTPUT_SUBDIR = "output"
 DEFAULT_LOGO_PATH = Path(__file__).resolve().with_name("Alta Biotech Logo.jpg")
 DEFAULT_ECOLI_REFERENCE_FASTA = Path(__file__).resolve().with_name("E. Coli Genome.fna")
+ORDER_VIRTUAL_GEL_GLOB = "Order_*_virtual_gel.png"
 HOST_DNA_MIN_ALIGNED_BP = 1300
 HOST_DNA_MIN_ALIGNED_PCT = 91.0
 RAW_FASTQ_MIN_RECORDS = 100
@@ -487,6 +490,28 @@ def sample_stem_for_record(barcode: str, metadata: dict[str, str], contig_label:
     return f"{base}_{contig_label}" if contig_label else base
 
 
+def virtual_gel_label_for_sample(metadata: dict[str, str], barcode: str) -> str:
+    sample_name = (
+        metadata.get("worksheet_sample_name")
+        or metadata.get("sample_name")
+        or barcode
+    )
+    parts = []
+    order_index = normalize_excel_number_text(metadata.get("order_sample_number"))
+    if order_index:
+        try:
+            parts.append(f"{int(order_index):03d}")
+        except ValueError:
+            parts.append(order_index)
+    sample_id = normalize_excel_number_text(metadata.get("sample_id"))
+    if sample_id:
+        parts.append(sample_id)
+    if sample_name and sample_name not in parts:
+        parts.append(sample_name)
+    label = " - ".join(part.strip() for part in parts if part and part.strip())
+    return "".join(ch if 32 <= ord(ch) < 127 else "_" for ch in label).strip() or barcode
+
+
 def add_discovered_file(
     records: dict[str, dict[str, object]],
     discovery_errors: list[dict[str, str]],
@@ -667,6 +692,21 @@ def serialize_path_value(value: object) -> str | list[str] | None:
     if len(paths) == 1:
         return str(paths[0])
     return [str(path) for path in paths]
+
+
+def deserialize_path_value(value: object) -> list[Path]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [Path(value)]
+    if isinstance(value, list):
+        paths = []
+        for item in value:
+            if not isinstance(item, str):
+                raise ValueError(f"invalid serialized path list entry: {item!r}")
+            paths.append(Path(item))
+        return paths
+    raise ValueError(f"invalid serialized path value: {value!r}")
 
 
 def infer_fastq_barcode(path: Path) -> str | None:
@@ -1563,6 +1603,134 @@ def plot_read_length_vs_bases(
     return out_path
 
 
+def read_lengths_from_serialized_alignment_input(input_value: object, input_type: str) -> list[int]:
+    paths = deserialize_path_value(input_value)
+    if not paths:
+        raise ValueError("missing selected raw read input")
+    if input_type == "fastq":
+        return list(read_lengths_by_name_from_fastq(paths).values())
+    if input_type == "bam":
+        if len(paths) != 1:
+            raise ValueError("BAM alignment input must contain exactly one path")
+        return list(read_lengths_by_name_from_bam(paths[0]).values())
+    raise ValueError(f"unsupported selected raw read input type: {input_type!r}")
+
+
+def package_summary_sort_key(summary: dict[str, object]) -> tuple[int, str, str]:
+    order_sample_number = summary.get("order_sample_number")
+    try:
+        order_index = int(str(order_sample_number))
+    except (TypeError, ValueError):
+        order_index = 10**9
+    return (
+        order_index,
+        str(summary.get("sample_name", "")),
+        str(summary.get("record_id", summary.get("barcode", ""))),
+    )
+
+
+def package_summary_virtual_gel_label(summary: dict[str, object]) -> str:
+    for key in ("virtual_gel_label", "sample_name", "record_id", "barcode"):
+        value = summary.get(key)
+        if value:
+            return str(value)
+    return "sample"
+
+
+def unique_label(label: str, used: set[str]) -> str:
+    if label not in used:
+        used.add(label)
+        return label
+    index = 2
+    while f"{label} ({index})" in used:
+        index += 1
+    label = f"{label} ({index})"
+    used.add(label)
+    return label
+
+
+def order_virtual_gel_filename(order_number: str) -> str:
+    return f"Order_{slugify(order_number)}_virtual_gel.png"
+
+
+def package_summaries_by_order(output_root: Path, order_numbers: Iterable[str]) -> dict[str, list[dict[str, object]]]:
+    requested_orders = {str(order_number) for order_number in order_numbers}
+    grouped: dict[str, list[dict[str, object]]] = defaultdict(list)
+    work_root = output_root / "_work"
+    if not work_root.exists():
+        return grouped
+    for summary_path in sorted(work_root.glob("*/package_summary.json")):
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        order_number = summary.get("order_number")
+        if order_number is None or str(order_number) not in requested_orders:
+            continue
+        summary["_summary_path"] = str(summary_path)
+        grouped[str(order_number)].append(summary)
+    return grouped
+
+
+def generate_order_virtual_gels(
+    output_root: Path,
+    order_numbers: Iterable[str],
+) -> tuple[dict[str, str], list[dict[str, str]]]:
+    summaries_by_order = package_summaries_by_order(output_root, order_numbers)
+    virtual_gels = {}
+    warnings = []
+    for order_number, summaries in sorted(summaries_by_order.items()):
+        order_dir = None
+        sample_lengths = {}
+        used_labels = set()
+        for summary in sorted(summaries, key=package_summary_sort_key):
+            paths = summary.get("paths") or {}
+            if not isinstance(paths, dict):
+                warnings.append(
+                    {
+                        "order_number": order_number,
+                        "reason": f"package summary has invalid paths: {summary.get('_summary_path')}",
+                    }
+                )
+                continue
+            if order_dir is None and paths.get("order_dir"):
+                order_dir = Path(str(paths["order_dir"]))
+            input_type = paths.get("alignment_input_type")
+            try:
+                lengths = read_lengths_from_serialized_alignment_input(
+                    paths.get("alignment_input"),
+                    str(input_type),
+                )
+            except Exception as exc:
+                warnings.append(
+                    {
+                        "order_number": order_number,
+                        "sample_name": str(summary.get("sample_name", "")),
+                        "reason": f"virtual gel read-length extraction failed: {exc}",
+                    }
+                )
+                continue
+            label = unique_label(package_summary_virtual_gel_label(summary), used_labels)
+            sample_lengths[label] = lengths
+
+        if order_dir is None:
+            warnings.append({"order_number": order_number, "reason": "could not determine order output directory"})
+            continue
+        if not sample_lengths:
+            warnings.append({"order_number": order_number, "reason": "no sample read lengths available for virtual gel"})
+            continue
+
+        out_path = order_dir / PACKAGE_SUBDIRS["qc"] / order_virtual_gel_filename(order_number)
+        make_virtual_gel(
+            sample_lengths,
+            out_path,
+            title=f"Virtual Gel - WPS Order {order_number}",
+            min_display_bp=READ_LENGTH_DISTRIBUTION_MIN_DISPLAY_BP,
+        )
+        virtual_gels[order_number] = str(out_path)
+    return virtual_gels, warnings
+
+
 def find_existing_path(paths: Iterable[Path | None]) -> Path | None:
     for path in paths:
         if path is not None and path.exists():
@@ -1685,15 +1853,28 @@ def draw_table(fig, bbox, headers, values, col_widths=None) -> None:
     rounded_border = PathPatch(
         rounded_table_path(fig, bbox),
         facecolor="white",
-        edgecolor=THEME["table_border"],
-        linewidth=2.2,
+        edgecolor="none",
+        linewidth=0,
         transform=ax.transAxes,
         clip_on=False,
+        zorder=0,
     )
     ax.add_patch(rounded_border)
 
     grid_lines = []
     header_y = 0.52
+    header_fill = Rectangle(
+        (0.0, header_y),
+        1.0,
+        1.0 - header_y,
+        facecolor=THEME["table_header_fill"],
+        edgecolor="none",
+        transform=ax.transAxes,
+        zorder=0.5,
+    )
+    header_fill.set_clip_path(rounded_border)
+    ax.add_patch(header_fill)
+
     grid_lines.extend(ax.plot([0.0, 1.0], [header_y, header_y], color=THEME["table_grid"], linewidth=0.75))
     x = 0.0
     centers = []
@@ -1704,6 +1885,17 @@ def draw_table(fig, bbox, headers, values, col_widths=None) -> None:
             grid_lines.extend(ax.plot([x, x], [0.0, 1.0], color=THEME["table_grid"], linewidth=0.75))
     for line in grid_lines:
         line.set_clip_path(rounded_border)
+
+    rounded_outline = PathPatch(
+        rounded_table_path(fig, bbox),
+        facecolor="none",
+        edgecolor=THEME["table_border"],
+        linewidth=2.2,
+        transform=ax.transAxes,
+        clip_on=False,
+        zorder=3,
+    )
+    ax.add_patch(rounded_outline)
 
     def value_font_size(text: str, col_width: float) -> float:
         char_capacity = max(1.0, col_width * 88.0)
@@ -2033,6 +2225,14 @@ def remove_empty_package_dirs(order_dir: Path) -> None:
         pass
 
 
+def remove_order_virtual_gel_files(order_dir: Path, output_root: Path) -> None:
+    qc_dir = order_dir / PACKAGE_SUBDIRS["qc"]
+    if not qc_dir.exists() or not qc_dir.is_dir():
+        return
+    for path in qc_dir.glob(ORDER_VIRTUAL_GEL_GLOB):
+        remove_output_path(path, output_root)
+
+
 def cleanup_previous_sample_output(output_root: Path, barcode: str, sample_stem: str) -> None:
     work_root = output_root / "_work"
     touched_order_dirs: set[Path] = set()
@@ -2073,6 +2273,7 @@ def cleanup_previous_sample_output(output_root: Path, barcode: str, sample_stem:
     remove_output_path(current_work_dir, output_root)
 
     for order_dir in touched_order_dirs:
+        remove_order_virtual_gel_files(order_dir, output_root)
         remove_empty_package_dirs(order_dir)
 
 
@@ -2099,6 +2300,7 @@ def package_sample(
     sample_stem = sample_stem_for_record(barcode, metadata, contig_label)
     output_stem = sample_stem if contig_label else f"{sample_stem}_contig"
     sequence_name = output_stem
+    virtual_gel_label = virtual_gel_label_for_sample(metadata, barcode)
     order_number = metadata.get("order_number")
     if not order_number:
         raise ValueError("metadata is missing order_number; refusing to package under WPS Data_Order #UNKNOWN")
@@ -2312,6 +2514,8 @@ def package_sample(
                 "primary_contig_label": record.get("primary_contig_label"),
                 "ignored_contig_labels": record.get("ignored_contig_labels"),
                 "sample_name": sample_stem,
+                "virtual_gel_label": virtual_gel_label,
+                "order_sample_number": metadata.get("order_sample_number"),
                 "order_number": order_number,
                 "multimer_denominator": multimer_denominator,
                 "warnings": warnings,
@@ -2345,6 +2549,8 @@ def package_sample(
         "primary_contig_label": record.get("primary_contig_label"),
         "ignored_contig_labels": record.get("ignored_contig_labels"),
         "sample_name": sample_stem,
+        "virtual_gel_label": virtual_gel_label,
+        "order_sample_number": metadata.get("order_sample_number"),
         "order_number": order_number,
         "order_dir": str(order_dir),
         "pdf": str(pdf_out),
@@ -2580,6 +2786,10 @@ def main() -> None:
             skipped.append({"barcode": barcode, "record_id": record_id, "reason": str(exc)})
 
     grouped_orders = group_packaged_by_order(packaged)
+    virtual_gels, virtual_gel_warnings = generate_order_virtual_gels(output_dir, grouped_orders.keys())
+    for order_number, gel_path in virtual_gels.items():
+        if order_number in grouped_orders:
+            grouped_orders[order_number]["virtual_gel_png"] = gel_path
 
     summary = {
         "folder_name": folder_name,
@@ -2591,6 +2801,7 @@ def main() -> None:
         "output_dir": str(output_dir),
         "packaged": packaged,
         "orders": grouped_orders,
+        "virtual_gel_warnings": virtual_gel_warnings,
         "skipped": skipped,
     }
     summary_path = output_dir / "run_summary.json"
@@ -2603,10 +2814,14 @@ def main() -> None:
     print(f"skipped_count: {len(skipped)}")
     for order_number, order in sorted(grouped_orders.items()):
         print(f"order: {order_number} -> {order['order_dir']} ({order['sample_count']} sample(s))")
+        if order.get("virtual_gel_png"):
+            print(f"virtual_gel: {order_number} -> {order['virtual_gel_png']}")
     for item in packaged:
         print(f"packaged: {item.get('record_id', item['barcode'])} -> {item['order_dir']}")
         for warning in item.get("warnings", []):
             print(f"warning: {item.get('record_id', item['barcode'])} ({warning})")
+    for item in virtual_gel_warnings:
+        print(f"warning: virtual gel {item.get('order_number', 'unknown')} ({item.get('reason', 'unknown warning')})")
     for item in skipped:
         print(f"skipped: {item.get('record_id', item['barcode'])} ({item['reason']})")
 
