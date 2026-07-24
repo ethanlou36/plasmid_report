@@ -76,7 +76,7 @@ def _round_axis_top(value: float, min_display_bp: int) -> int:
 
 
 def _band_width_bp(center_bp: float) -> float:
-    return max(45.0, min(140.0, center_bp * 0.006))
+    return max(55.0, min(160.0, center_bp * 0.007))
 
 
 def _weighted_center(lengths: np.ndarray, fallback: float) -> float:
