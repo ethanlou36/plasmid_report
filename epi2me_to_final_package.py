@@ -1682,6 +1682,7 @@ def generate_order_virtual_gels(
     for order_number, summaries in sorted(summaries_by_order.items()):
         order_dir = None
         sample_lengths = {}
+        expected_lengths = {}
         used_labels = set()
         for summary in sorted(summaries, key=package_summary_sort_key):
             paths = summary.get("paths") or {}
@@ -1712,6 +1713,12 @@ def generate_order_virtual_gels(
                 continue
             label = unique_label(package_summary_virtual_gel_label(summary), used_labels)
             sample_lengths[label] = lengths
+            contig_length = summary.get("contig_length_bp")
+            if contig_length is not None:
+                try:
+                    expected_lengths[label] = float(contig_length)
+                except (TypeError, ValueError):
+                    pass
 
         if order_dir is None:
             warnings.append({"order_number": order_number, "reason": "could not determine order output directory"})
@@ -1720,12 +1727,13 @@ def generate_order_virtual_gels(
             warnings.append({"order_number": order_number, "reason": "no sample read lengths available for virtual gel"})
             continue
 
-        out_path = order_dir / PACKAGE_SUBDIRS["qc"] / order_virtual_gel_filename(order_number)
+        out_path = order_dir / order_virtual_gel_filename(order_number)
         make_virtual_gel(
             sample_lengths,
             out_path,
             title=f"Virtual Gel - WPS Order {order_number}",
             min_display_bp=READ_LENGTH_DISTRIBUTION_MIN_DISPLAY_BP,
+            expected_lengths=expected_lengths,
         )
         virtual_gels[order_number] = str(out_path)
     return virtual_gels, warnings
@@ -2226,6 +2234,8 @@ def remove_empty_package_dirs(order_dir: Path) -> None:
 
 
 def remove_order_virtual_gel_files(order_dir: Path, output_root: Path) -> None:
+    for path in order_dir.glob(ORDER_VIRTUAL_GEL_GLOB):
+        remove_output_path(path, output_root)
     qc_dir = order_dir / PACKAGE_SUBDIRS["qc"]
     if not qc_dir.exists() or not qc_dir.is_dir():
         return
@@ -2517,6 +2527,7 @@ def package_sample(
                 "virtual_gel_label": virtual_gel_label,
                 "order_sample_number": metadata.get("order_sample_number"),
                 "order_number": order_number,
+                "contig_length_bp": renamed["length_bp"],
                 "multimer_denominator": multimer_denominator,
                 "warnings": warnings,
                 "circular_coverage_diagnostic": circular_diagnostic,
@@ -2552,6 +2563,7 @@ def package_sample(
         "virtual_gel_label": virtual_gel_label,
         "order_sample_number": metadata.get("order_sample_number"),
         "order_number": order_number,
+        "contig_length_bp": renamed["length_bp"],
         "order_dir": str(order_dir),
         "pdf": str(pdf_out),
         "warnings": warnings,

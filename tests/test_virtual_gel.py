@@ -5,7 +5,7 @@ import numpy as np
 import pysam
 
 from epi2me_to_final_package import cleanup_previous_sample_output, generate_order_virtual_gels
-from virtual_gel import make_virtual_gel, resolve_virtual_gel_y_max
+from virtual_gel import make_virtual_gel, resolve_virtual_gel_y_max, select_virtual_gel_bands
 
 
 def write_unaligned_bam(path: Path) -> None:
@@ -48,6 +48,16 @@ def test_virtual_gel_y_max_uses_full_displayed_range():
     assert y_max == 13000
 
 
+def test_virtual_gel_selects_expected_multimer_bands_and_drops_smear():
+    bands = select_virtual_gel_bands(
+        [5000] * 100 + [7500] * 40 + [10000] * 20 + [20000] * 3,
+        expected_length_bp=5000,
+    )
+
+    assert [band.multiple for band in bands] == [1, 2]
+    assert all(abs(band.center_bp - expected) < 100 for band, expected in zip(bands, [5000, 10000]))
+
+
 def test_generate_order_virtual_gel_uses_package_summary_fastq(tmp_path: Path):
     output_root = tmp_path / "output"
     order_dir = output_root / "WPS Data_Order #TEST"
@@ -67,6 +77,7 @@ def test_generate_order_virtual_gel_uses_package_summary_fastq(tmp_path: Path):
                 "sample_name": "001_sample",
                 "virtual_gel_label": "001 - sample",
                 "order_sample_number": "1",
+                "contig_length_bp": 5000,
                 "paths": {
                     "order_dir": str(order_dir),
                     "alignment_input": str(fastq_path),
@@ -82,6 +93,7 @@ def test_generate_order_virtual_gel_uses_package_summary_fastq(tmp_path: Path):
     assert warnings == []
     assert "TEST" in virtual_gels
     assert Path(virtual_gels["TEST"]).exists()
+    assert Path(virtual_gels["TEST"]).parent == order_dir
 
 
 def test_generate_order_virtual_gel_uses_package_summary_bam(tmp_path: Path):
@@ -99,6 +111,7 @@ def test_generate_order_virtual_gel_uses_package_summary_bam(tmp_path: Path):
                 "sample_name": "001_sample",
                 "virtual_gel_label": "001 - sample",
                 "order_sample_number": "1",
+                "contig_length_bp": 5000,
                 "paths": {
                     "order_dir": str(order_dir),
                     "alignment_input": str(bam_path),
@@ -114,6 +127,7 @@ def test_generate_order_virtual_gel_uses_package_summary_bam(tmp_path: Path):
     assert warnings == []
     assert "TEST" in virtual_gels
     assert Path(virtual_gels["TEST"]).exists()
+    assert Path(virtual_gels["TEST"]).parent == order_dir
 
 
 def test_cleanup_previous_sample_output_removes_stale_order_virtual_gel(tmp_path: Path):
@@ -121,7 +135,9 @@ def test_cleanup_previous_sample_output_removes_stale_order_virtual_gel(tmp_path
     order_dir = output_root / "WPS Data_Order #TEST"
     qc_dir = order_dir / "QC REPORTS"
     qc_dir.mkdir(parents=True)
-    stale_gel = qc_dir / "Order_TEST_virtual_gel.png"
+    old_stale_gel = qc_dir / "Order_TEST_virtual_gel.png"
+    old_stale_gel.write_bytes(b"stale")
+    stale_gel = order_dir / "Order_TEST_virtual_gel.png"
     stale_gel.write_bytes(b"stale")
 
     work_dir = output_root / "_work" / "001_sample"
@@ -143,3 +159,4 @@ def test_cleanup_previous_sample_output_removes_stale_order_virtual_gel(tmp_path
     cleanup_previous_sample_output(output_root, "barcode01", "001_sample")
 
     assert not stale_gel.exists()
+    assert not old_stale_gel.exists()
