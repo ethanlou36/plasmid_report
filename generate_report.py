@@ -34,6 +34,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pysam
+from Bio import SeqIO
+from Bio.SeqIO.InsdcIO import _insdc_location_string
 
 from bam_to_per_base_data import summarize_bam_to_table
 
@@ -124,61 +126,77 @@ def parse_plasmidasaurus_summary(path):
     }
 
 
-def parse_genbank_summary(path):
-    locus_name = None
-    locus_length = None
-    is_circular = None
-    in_features = False
-    features = []
-    current_feature = None
+def _summary_qualifier_value(values):
+    """Keep the prior scalar qualifier shape while retaining repeated values."""
+    if not isinstance(values, (list, tuple)):
+        return values
+    if not values or values == [""]:
+        return True
+    if len(values) == 1:
+        return values[0]
+    return list(values)
 
+
+def _summary_location_segments(location):
+    """Return Biopython locations as one-based, end-inclusive segments."""
+    if location is None:
+        return []
+
+    segments = []
+    for part in location.parts:
+        try:
+            start = int(part.start) + 1
+            end = int(part.end)
+        except TypeError:
+            start = None
+            end = None
+        segments.append(
+            {
+                "start": start,
+                "end": end,
+                "strand": part.strand,
+            }
+        )
+    return segments
+
+
+def parse_genbank_summary(path):
     with open(path, "r", encoding="utf-8-sig", errors="replace") as handle:
-        for raw_line in handle:
-            line = raw_line.rstrip("\n")
-            if line.startswith("LOCUS"):
-                parts = line.split()
-                if len(parts) >= 3:
-                    locus_name = parts[1]
-                    try:
-                        locus_length = int(parts[2])
-                    except ValueError:
-                        locus_length = None
-                is_circular = "circular" in line.lower()
-            elif line.startswith("FEATURES"):
-                in_features = True
-                continue
-            elif line.startswith("ORIGIN") or line.startswith("//"):
-                in_features = False
-                current_feature = None
-            elif in_features:
-                if line.startswith("     ") and not line.startswith("                     /"):
-                    feature_type = line[5:21].strip()
-                    location = line[21:].strip()
-                    if feature_type:
-                        current_feature = {
-                            "type": feature_type,
-                            "location": location,
-                            "qualifiers": {},
-                        }
-                        features.append(current_feature)
-                elif current_feature and line.startswith("                     /"):
-                    qualifier = line.strip()[1:]
-                    if "=" in qualifier:
-                        key, value = qualifier.split("=", 1)
-                        current_feature["qualifiers"][key] = value.strip('"')
-                    else:
-                        current_feature["qualifiers"][qualifier] = True
+        record = SeqIO.read(handle, "genbank")
+
+    features = []
+    for feature in record.features:
+        qualifiers = {
+            key: _summary_qualifier_value(values)
+            for key, values in feature.qualifiers.items()
+        }
+        location = (
+            _insdc_location_string(feature.location, len(record))
+            if feature.location is not None
+            else ""
+        )
+        features.append(
+            {
+                "type": feature.type,
+                "location": location,
+                "qualifiers": qualifiers,
+                "segments": _summary_location_segments(feature.location),
+            }
+        )
 
     feature_counts = Counter(feature["type"] for feature in features)
-    labels = [
-        feature["qualifiers"].get("label")
-        for feature in features
-        if feature["qualifiers"].get("label")
-    ]
+    labels = []
+    for feature in features:
+        label = feature["qualifiers"].get("label")
+        if isinstance(label, list):
+            labels.extend(value for value in label if value)
+        elif label:
+            labels.append(label)
+
     return {
-        "locus_name": locus_name,
-        "length_bp": locus_length,
-        "is_circular": is_circular,
+        "locus_name": record.name,
+        "length_bp": len(record),
+        "is_circular": str(record.annotations.get("topology", "")).lower() == "circular",
         "feature_count": len(features),
         "feature_type_counts": dict(sorted(feature_counts.items())),
         "labels": labels,
@@ -619,6 +637,18 @@ def location_segments(location):
     return [(int(start), int(end)) for start, end in re.findall(r"(\d+)\.\.(\d+)", location)]
 
 
+def feature_location_segments(feature):
+    """Prefer parsed GenBank segments, with a fallback for legacy summaries."""
+    segments = feature.get("segments")
+    if segments is not None:
+        return [
+            (segment["start"], segment["end"])
+            for segment in segments
+            if segment.get("start") is not None and segment.get("end") is not None
+        ]
+    return location_segments(feature.get("location", ""))
+
+
 def plot_feature_map(gbk_summary, contig_length, out_path, title):
     features = gbk_summary["features"]
     if not features:
@@ -643,12 +673,14 @@ def plot_feature_map(gbk_summary, contig_length, out_path, title):
         y = 0.2 + (idx % row_count) * 0.18
         feature_type = feature["type"]
         color = color_by_type.get(feature_type, "#7f7f7f")
-        for start, end in location_segments(feature["location"]):
+        segments = feature_location_segments(feature)
+        for start, end in segments:
             ax.broken_barh([(start - 1, end - start + 1)], (y, 0.12), facecolors=color)
         label = feature["qualifiers"].get("label", feature_type)
-        first_segment = location_segments(feature["location"])
-        if first_segment:
-            ax.text(first_segment[0][0], y + 0.14, label, fontsize=7, va="bottom")
+        if isinstance(label, list):
+            label = ", ".join(str(value) for value in label)
+        if segments:
+            ax.text(segments[0][0], y + 0.14, label, fontsize=7, va="bottom")
 
     ax.set_xlim(0, contig_length)
     ax.set_ylim(-0.05, 0.2 + row_count * 0.18 + 0.18)

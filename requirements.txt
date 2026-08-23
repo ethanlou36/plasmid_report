@@ -1,0 +1,4 @@
+biopython>=1.88,<2
+matplotlib
+numpy
+pysam

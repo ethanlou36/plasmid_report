@@ -5,10 +5,11 @@ Build customer-facing WPS order folders from an EPI2ME export.
 This workflow:
 1. discovers per-barcode EPI2ME files
 2. maps barcodes to customer metadata
-3. realigns raw FASTQ reads, or raw unmapped BAM reads, to the final consensus FASTA
-4. generates per-base CSVs, QC plots, and synthetic AB1 files
-5. writes a customer-ready package grouped by order number
-6. renders a 2-page PDF report with an Alta-style layout
+3. normalizes circular FASTA and GenBank records to a shared canonical origin
+4. realigns raw FASTQ reads, or raw unmapped BAM reads, to the normalized consensus FASTA
+5. generates per-base CSVs, QC plots, and synthetic AB1 files
+6. writes a customer-ready package grouped by order number
+7. renders a 2-page PDF report with an Alta-style layout
 """
 
 from __future__ import annotations
@@ -61,6 +62,13 @@ from generate_report import (
     read_first_fasta_record,
     read_per_base_rows,
     y_axis_top_with_headroom,
+)
+from plasmid_normalization import (
+    DEFAULT_ORIGIN_MOTIF,
+    OriginNormalizationError,
+    apply_transform_to_fastq,
+    canonicalize_sequence,
+    normalize_plasmid_files,
 )
 from virtual_gel import make_virtual_gel
 
@@ -1109,37 +1117,6 @@ def find_candidate_sample_stem_collisions(candidates: list[dict[str, object]]) -
     return collisions
 
 
-def write_renamed_fasta(src_fasta: Path, dst_fasta: Path, sequence_name: str) -> dict[str, str | int]:
-    record = read_first_fasta_record(src_fasta)
-    sequence = "".join(ch if ord(ch) < 128 else "N" for ch in record["sequence"])
-    dst_fasta.parent.mkdir(parents=True, exist_ok=True)
-    with dst_fasta.open("w", encoding="ascii") as handle:
-        handle.write(f">{sequence_name}\n")
-        for start in range(0, len(sequence), 80):
-            handle.write(sequence[start : start + 80] + "\n")
-    return {"name": sequence_name, "sequence": sequence, "length_bp": len(sequence)}
-
-
-def rewrite_genbank_locus(src_gbk: Path, dst_gbk: Path, locus_name: str) -> None:
-    dst_gbk.parent.mkdir(parents=True, exist_ok=True)
-    lines = src_gbk.read_text(encoding="utf-8-sig", errors="replace").splitlines()
-    safe_locus = re.sub(r"[^A-Za-z0-9_.-]+", "_", locus_name).strip("_")[:16] or "record"
-    out_lines = []
-    for idx, line in enumerate(lines):
-        if idx == 0 and line.startswith("LOCUS"):
-            parts = line.split()
-            if len(parts) >= 3:
-                bp = parts[2]
-                remainder = ""
-                if "bp" in line:
-                    remainder = line[line.index("bp") + 2 :]
-                line = f"LOCUS       {safe_locus:<16}{bp:>11} bp{remainder}"
-            else:
-                line = f"LOCUS       {safe_locus}"
-        out_lines.append(line)
-    dst_gbk.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
-
-
 def parse_fastq_record(path: Path) -> tuple[str, str, str]:
     with path.open("r", encoding="utf-8-sig", errors="replace") as handle:
         header = handle.readline().rstrip("\n\r")
@@ -1176,20 +1153,59 @@ def generate_ab1_files(
     fastq_path: Path | None,
     output_dir: Path,
     output_stem: str,
+    origin_motif: str = DEFAULT_ORIGIN_MOTIF,
+    quality_audit: dict[str, object] | None = None,
+    warnings: list[str] | None = None,
 ) -> list[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     record = read_first_fasta_record(fasta_path)
+    audit = {
+        "source": "default_q30",
+        "consensus_fastq": str(fastq_path) if fastq_path else None,
+        "reason": "consensus FASTQ is unavailable",
+    }
     if fastq_path and fastq_path.exists():
         _, fastq_seq, fastq_qual = parse_fastq_record(fastq_path)
-        if fastq_seq == record["sequence"]:
-            q_scores = phred_from_ascii(fastq_qual, phred_offset=33)
-        else:
+        try:
+            _, fastq_transform = canonicalize_sequence(
+                fastq_seq,
+                origin_motif,
+                label=str(fastq_path),
+            )
+            normalized_fastq_seq, normalized_fastq_qual = apply_transform_to_fastq(
+                fastq_seq,
+                fastq_qual,
+                fastq_transform,
+            )
+            if normalized_fastq_seq != record["sequence"]:
+                raise OriginNormalizationError(
+                    "consensus FASTQ sequence does not match the canonical packaged FASTA"
+                )
+        except OriginNormalizationError as exc:
             q_scores = None
+            audit["reason"] = str(exc)
+        else:
+            q_scores = phred_from_ascii(normalized_fastq_qual, phred_offset=33)
+            audit.update(
+                source="normalized_consensus_fastq",
+                transform=fastq_transform.as_dict(),
+                reason=None,
+            )
     else:
         q_scores = None
 
     if q_scores is None:
         q_scores = [30] * len(record["sequence"])
+        if warnings is not None and fastq_path:
+            detail = (
+                f"AB1 consensus qualities could not be mapped; using default Q30 ({audit['reason']})"
+                if fastq_path.exists()
+                else f"consensus FASTQ does not exist; using default Q30: {fastq_path}"
+            )
+            warnings.append(detail)
+
+    if quality_audit is not None:
+        quality_audit.update(audit)
 
     traces, peak_locs, seq, q_scores = synthesize_chromatogram(
         record["sequence"],
@@ -2300,6 +2316,7 @@ def package_sample(
     use_bam: bool = False,
     multimer_denominator: str = DEFAULT_MULTIMER_DENOMINATOR,
     circular_coverage: bool = True,
+    origin_motif: str = DEFAULT_ORIGIN_MOTIF,
 ) -> dict[str, object]:
     barcode = record.get("barcode")
     if not isinstance(barcode, str):
@@ -2353,8 +2370,15 @@ def package_sample(
 
     fasta_out = package_dirs["fasta"] / f"{output_stem}.fa"
     gbk_out = package_dirs["gbk"] / f"{output_stem}.gbk"
-    renamed = write_renamed_fasta(fasta_path, fasta_out, sequence_name)
-    rewrite_genbank_locus(gbk_path, gbk_out, sequence_name)
+    renamed = normalize_plasmid_files(
+        fasta_path,
+        gbk_path,
+        fasta_out,
+        gbk_out,
+        sequence_name,
+        motif=origin_motif,
+    )
+    origin_normalization = renamed["origin_normalization"]
 
     alignment_dir = work_dir / "alignment"
     if raw_fastq_paths and not use_bam:
@@ -2448,6 +2472,11 @@ def package_sample(
         ecoli_contamination_details=host_contamination_details,
         multimer_denominator=multimer_denominator,
     )
+    report_summary["origin_normalization"] = origin_normalization
+    if report_summary.get("maf_summary") is not None:
+        report_summary["maf_summary"]["coordinate_basis"] = (
+            "original EPI2ME contig before origin normalization"
+        )
     warnings.extend(validate_length_consistency(metadata, renamed["length_bp"], report_summary))
 
     circular_diagnostic = None
@@ -2491,7 +2520,18 @@ def package_sample(
     shutil.copyfile(per_base_src, per_base_dst)
     shutil.copyfile(low_conf_src, low_conf_dst)
 
-    ab1_paths = generate_ab1_files(fasta_out, fastq_path, package_dirs["ab1"], output_stem)
+    ab1_quality_audit: dict[str, object] = {}
+    ab1_paths = generate_ab1_files(
+        fasta_out,
+        fastq_path,
+        package_dirs["ab1"],
+        output_stem,
+        origin_motif=origin_motif,
+        quality_audit=ab1_quality_audit,
+        warnings=warnings,
+    )
+    origin_normalization["consensus_fastq_quality"] = ab1_quality_audit
+    write_report_summary_json(report_summary)
 
     bases_plot = plot_read_length_vs_bases(
         raw_reads_path,
@@ -2529,6 +2569,7 @@ def package_sample(
                 "order_number": order_number,
                 "contig_length_bp": renamed["length_bp"],
                 "multimer_denominator": multimer_denominator,
+                "origin_normalization": origin_normalization,
                 "warnings": warnings,
                 "circular_coverage_diagnostic": circular_diagnostic,
                 "paths": {
@@ -2564,6 +2605,7 @@ def package_sample(
         "order_sample_number": metadata.get("order_sample_number"),
         "order_number": order_number,
         "contig_length_bp": renamed["length_bp"],
+        "origin_normalization": origin_normalization,
         "order_dir": str(order_dir),
         "pdf": str(pdf_out),
         "warnings": warnings,
@@ -2646,6 +2688,14 @@ def parse_args() -> argparse.Namespace:
             "classified-reads reports percentages only among reads classified as 1x-4x; "
             "all-eligible-reads includes unclassified eligible mapped reads in the denominator. "
             "PDF table percentages are base-weighted."
+        ),
+    )
+    parser.add_argument(
+        "--origin-motif",
+        default=DEFAULT_ORIGIN_MOTIF,
+        help=(
+            "Exact motif used to choose the canonical circular plasmid origin. "
+            f"Default: {DEFAULT_ORIGIN_MOTIF}. Matching is case-insensitive and checks both strands."
         ),
     )
     parser.add_argument(
@@ -2790,6 +2840,7 @@ def main() -> None:
                     use_bam=args.use_bam,
                     multimer_denominator=args.multimer_denominator,
                     circular_coverage=args.circ,
+                    origin_motif=args.origin_motif,
                 )
             )
         except subprocess.CalledProcessError as exc:
@@ -2810,6 +2861,7 @@ def main() -> None:
         "metadata": str(metadata_path) if metadata_path else None,
         "multimer_denominator": args.multimer_denominator,
         "circular_coverage": args.circ,
+        "origin_motif": args.origin_motif.upper(),
         "output_dir": str(output_dir),
         "packaged": packaged,
         "orders": grouped_orders,

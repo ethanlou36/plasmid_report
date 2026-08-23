@@ -41,7 +41,7 @@ sudo apt update
 sudo apt install python3 python3-venv python3-pip minimap2 samtools
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install pysam numpy matplotlib
+python -m pip install -r requirements.txt
 ```
 
 ## 2. Input Folder Location
@@ -86,6 +86,21 @@ Each barcode must have:
   the script aggregates all parts as one raw input. The raw FASTQ input must
   contain at least 100 reads and 100,000 read bases. Use `--use-bam` only when
   you intentionally want to run from a raw/unmapped `.bam` file instead.
+
+Before any alignment or report analysis, the workflow normalizes the primary
+plasmid FASTA and GenBank record to begin with the exact, case-insensitive motif
+`TTGAGATCCTTT`. Matching is circular, so the motif may cross the original end of
+the contig. If the motif occurs only on the opposite strand, the record is
+reverse-complemented before it is rotated. GenBank feature coordinates, strands,
+compound locations, and qualifiers are transformed with the sequence so the
+packaged FASTA and GenBank remain synchronized.
+
+Normalization is intentionally strict. A sample is skipped if the motif is
+missing or ambiguous, or if the normalized FASTA and GenBank sequences do not
+match exactly. A rotation is also rejected when a feature uses a fuzzy or remote
+location that cannot be remapped safely. The original EPI2ME files are never
+modified; only the generated customer deliverables use the normalized origin
+and orientation.
 
 Optional files:
 
@@ -200,6 +215,8 @@ python3 epi2me_to_final_package.py \
 - `--multimer-denominator classified-reads` reports monomer/dimer/trimer/tetramer percentages only among reads that were close enough to 1x/2x/3x/4x plasmid length to classify. This is the default.
 - `--multimer-denominator all-eligible-reads` includes eligible mapped reads that were not classifiable and adds a base-weighted `Unclassified` column to the multimer table.
 - `--use-bam` uses BAM files for alignment, host DNA, read-length distribution, and multimer metrics even when a raw FASTQ/FASTQ.GZ file is detected.
+- `--origin-motif TTGAGATCCTTT` changes the exact motif used for origin
+  normalization. The default shown here should be used for ordinary WPS runs.
 - `--circ true` is the default and uses circular-projected coverage for PDF metrics, the PDF coverage map, and packaged per-base CSVs. Reads are aligned to a duplicated plasmid reference and projected back to the original coordinates. Pass `--circ false` to run the original linear-only pipeline.
 - `--threads 4` makes alignment faster.
 - `--sort-memory 1G` gives `samtools sort` more memory.
@@ -255,7 +272,10 @@ least 100 FASTQ records and at least 100,000 read bases. Passing `--use-bam`
 forces the workflow to use the raw/unmapped BAM instead.
 
 Plasmid alignment uses `minimap2 -ax map-ont` against the reported primary
-contig FASTA, then `samtools` converts, sorts, and indexes the alignment BAM.
+contig FASTA after origin normalization, then `samtools` converts, sorts, and
+indexes the alignment BAM. Consequently, per-base CSV positions, coverage maps,
+AB1 traces, and the packaged FASTA and GenBank all use the same canonical
+coordinate system beginning with `TTGAGATCCTTT`.
 The read-length graph uses the same raw read lengths used for alignment. Reads
 `<= 1,000 bp` are omitted from the displayed read-length graph. The graph is
 base-weighted, so each bin shows `Total Bases (kb)` rather than read count.
@@ -318,7 +338,9 @@ they are not used as the headline PDF value.
 The generated `report_summary.json` and `package_summary.json` files keep audit
 fields for these calculations, including host counts, host base totals, multimer
 eligible/classified/unclassified counts, multimer thresholds, selected input
-paths, and any warnings such as mixed-contig or split-FASTQ handling.
+paths, origin-normalization orientation and rotation details, and any warnings
+such as mixed-contig or split-FASTQ handling. `run_summary.json` records the
+configured origin motif.
 
 Each order folder also gets an order-level virtual gel PNG named
 `Order_<order>_virtual_gel.png`. The virtual gel uses the same selected raw read
@@ -340,6 +362,8 @@ Common causes:
   Use `contig001`, `contig002`, etc. in filenames for mixed-contig samples.
 - The BAM is already aligned instead of raw/unmapped.
 - Two samples produce the same filename after cleanup.
+- The origin motif is missing or has more than one distinct valid starting
+  point, or the FASTA and GenBank sequences disagree after normalization.
 
 If you intentionally need to debug intermediate alignment files, add:
 
