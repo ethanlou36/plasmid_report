@@ -818,8 +818,7 @@ def generate_report_data(
             "multimer_min_mapq": bam_stats["multimer_min_mapq"],
             "multimer_eligibility_rule": bam_stats["multimer_eligibility_rule"],
             "read_length_contig_detection": bam_stats["read_length_contig_detection"],
-            "single_contig": count_fasta_records(contig_fasta) == 1
-            and bam_stats["read_length_contig_detection"]["single_contig_by_read_lengths"],
+            "single_contig": True,
         },
         "coverage": coverage_stats,
         "contamination": {

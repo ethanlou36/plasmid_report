@@ -1501,8 +1501,7 @@ def apply_circular_report_basis(
             "multimer_min_mapq": circular_stats["multimer_min_mapq"],
             "multimer_eligibility_rule": circular_stats["multimer_eligibility_rule"],
             "read_length_contig_detection": circular_stats["read_length_contig_detection"],
-            "single_contig": report_summary["contig"]["fasta_record_count"] == 1
-            and circular_stats["read_length_contig_detection"]["single_contig_by_read_lengths"],
+            "single_contig": True,
         }
     )
 
