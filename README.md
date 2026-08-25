@@ -84,7 +84,7 @@ Each barcode must have:
   the same base name, such as `barcode01_0.fastq.gz`, `barcode01_1.fastq.gz`,
   or `barcode01-1.fastq.gz`, `barcode01-2.fastq.gz`,
   the script aggregates all parts as one raw input. The raw FASTQ input must
-  contain at least 100 reads and 100,000 read bases. Use `--use-bam` only when
+  contain at least 50 reads and 100,000 read bases. Use `--use-bam` only when
   you intentionally want to run from a raw/unmapped `.bam` file instead.
 
 Before any alignment or report analysis, the workflow normalizes the primary
@@ -268,7 +268,7 @@ file, and the raw reads for the same barcode. By default, raw reads come from
 the largest appropriately sized barcoded FASTQ/FASTQ.GZ input set. Split raw
 FASTQs with the same base name and a trailing `-number` or `_number` are
 aggregated as one input. A raw FASTQ input set must pass the sanity check of at
-least 100 FASTQ records and at least 100,000 read bases. Passing `--use-bam`
+least 50 FASTQ records and at least 100,000 read bases. Passing `--use-bam`
 forces the workflow to use the raw/unmapped BAM instead.
 
 Plasmid alignment uses `minimap2 -ax map-ont` against the reported primary
