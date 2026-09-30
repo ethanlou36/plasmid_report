@@ -11,28 +11,28 @@ def write_fastq(path: Path, record_count: int, read_length: int) -> None:
             handle.write(f"@read{index}\n{sequence}\n+\n{quality}\n")
 
 
-def test_fifty_reads_and_sixty_thousand_bases_are_eligible(tmp_path: Path):
+def test_twenty_reads_and_sixty_thousand_bases_are_eligible(tmp_path: Path):
     fastq = tmp_path / "barcode01.fastq"
-    write_fastq(fastq, record_count=50, read_length=1_200)
+    write_fastq(fastq, record_count=20, read_length=3_000)
 
     assert raw_fastq_rejection_reason(fastq) is None
 
 
-def test_fewer_than_fifty_reads_are_rejected_even_with_enough_bases(tmp_path: Path):
+def test_fewer_than_twenty_reads_are_rejected_even_with_enough_bases(tmp_path: Path):
     fastq = tmp_path / "barcode01.fastq"
-    write_fastq(fastq, record_count=49, read_length=2_100)
+    write_fastq(fastq, record_count=19, read_length=3_200)
 
     reason = raw_fastq_rejection_reason(fastq)
 
-    assert "only 49 FASTQ records" in reason
-    assert "expected at least 50" in reason
+    assert "only 19 FASTQ records" in reason
+    assert "expected at least 20" in reason
 
 
-def test_fifty_reads_are_rejected_when_total_bases_are_too_low(tmp_path: Path):
+def test_twenty_reads_are_rejected_when_total_bases_are_too_low(tmp_path: Path):
     fastq = tmp_path / "barcode01.fastq"
-    write_fastq(fastq, record_count=50, read_length=1_199)
+    write_fastq(fastq, record_count=20, read_length=2_999)
 
     reason = raw_fastq_rejection_reason(fastq)
 
-    assert "only 59,950 read bases" in reason
+    assert "only 59,980 read bases" in reason
     assert "expected at least 60,000" in reason
