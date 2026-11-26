@@ -52,6 +52,11 @@ The report command assumes all input run folders live under:
 /mnt/c/WPS data/
 ```
 
+Keep client sequencing files, worksheets, and generated reports in the lab's
+data folder outside the Git checkout. For local debugging inside the checkout,
+put client files under the ignored `client_data/` directory. Use synthetic
+data for new committed examples and tests.
+
 ## 3. Prepare the Input Folder
 
 Start with the EPI2ME output files for a sequencing run. Put the FASTA,

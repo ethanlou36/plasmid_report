@@ -19,48 +19,72 @@ __pycache__/
 venv/
 env/
 
-# Customer/run metadata should be passed with --metadata, not committed
+# Client inputs, metadata, and exports belong outside the checkout.
+/client_data/
+WPS data/
+*.csv
+*.tsv
+*.xls
 *.xlsx
+*.xlsm
+*.zip
+*.tar
+*.tgz
+*.tar.gz
+*.7z
+*.rar
 
 # Raw sequencing and alignment artifacts
 *.bam
 *.bai
 *.sam
-reads.fastq
-*_reads.fastq
+*.fastq
+*.fq
 *.fastq.gz
 *.fq.gz
+*.fa
+*.fasta
+*.fna
+*.fa.gz
+*.fasta.gz
+*.fna.gz
+*.gb
+*.gbk
+*.gbff
+*.genbank
+*.gb.gz
+*.gbk.gz
+*.gbff.gz
+*.genbank.gz
+*.maf
+*.maf.gz
 *.fai
-
-# Ad hoc input files dropped in the repo root during local runs/debugging
-/barcode*.annotations.gbk
-/barcode*.final.fasta
-/barcode*.final.fa
-/barcode*.final.fastq
-/barcode*.final.fq
-/barcode*.assembly.maf
-/DH5a, two contigs.zip
-/05262026_1143948.zip
-/002_A40905_scAAV-Cbh_report.pdf
-/FBD66624_pass_barcode02_1e5ac090_906ec2fe_0.bam
-/barcode02.final.fasta
 
 # Generated customer/package artifacts
 WPS Data_Order #*/
 customer_packages/
-example_data/output/
+output/
 example_data/*_report_output/
 **/_work/
 
 # Generated report/package file types
 *.ab1
 *.pdf
-!barcode01_example_report.pdf
 *.png
+*_report.html
+*_report.json
 
 # Generated summaries and per-base outputs
 run_summary.json
 package_summary.json
 report_summary.json
-*_per_base_details.csv
-*_low_confidence_bases.csv
+
+# Explicit exceptions for the bundled reference and existing examples.
+!/E. Coli Genome.fna
+!/barcode01_example_report.pdf
+!/example_data/barcode01_wps_working_sheet.csv
+!/example_data/epi2me_export/barcode01.annotations.gbk
+!/example_data/epi2me_export/barcode01.assembly.maf
+!/example_data/epi2me_export/barcode01.final.fasta
+!/example_data/epi2me_export/barcode01.final.fastq
+!/example_data/epi2me_export/barcode01_wps_working_sheet.csv
